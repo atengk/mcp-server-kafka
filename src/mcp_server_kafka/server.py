@@ -94,7 +94,45 @@ def create_mcp_server(
             logger.warning("查询 Kafka 主题详情失败 [topic=%s]: %s", topic_name, exc)
             return {"error": f"查询主题详情失败: {exc}"}
 
-    # 4. 注册写操作 Tools (双重安全防线之一：只读模式隐藏拦截)
+    # 4. 注册消息采样 Tool (零提交位移只读探查)
+    @server.tool(
+        name="kafka_sample_messages",
+        description="从指定 Kafka 主题以零提交位移方式只读采样消息（支持 latest/earliest/offset 策略与自适应解码）",
+    )
+    async def kafka_sample_messages(
+        topic: str,
+        partition: int | None = None,
+        strategy: str = "latest",
+        offset: int | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """以零位移影响方式采样拉取主题消息.
+
+        @param topic 目标主题名称
+        @param partition 可选指定物理分区
+        @param strategy 采样策略 (latest / earliest / offset)，默认 latest
+        @param offset 当 strategy=offset 时的起始数值
+        @param limit 采样条数限制，默认 10，上限 100
+        @return 包含 messages 列表与 total 总数的结果字典；失败时返回错误描述字典
+        """
+        try:
+            sampled = await mgr.sample_messages(
+                topic=topic,
+                partition=partition,
+                strategy=strategy,
+                offset=offset,
+                limit=limit,
+            )
+            return {
+                "topic": topic,
+                "messages": [m.model_dump() for m in sampled],
+                "total": len(sampled),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("采样 Kafka 消息失败 [topic=%s]: %s", topic, exc)
+            return {"error": f"采样消息失败: {exc}"}
+
+    # 5. 注册写操作 Tools (双重安全防线之一：只读模式隐藏拦截)
     if not cfg.read_only:
 
         @server.tool(

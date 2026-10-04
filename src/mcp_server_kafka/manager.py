@@ -5,10 +5,11 @@
 """
 
 import asyncio
+import base64
 import json
 from typing import Any
 
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 
 from mcp_server_kafka.config import KafkaConfig
@@ -17,6 +18,7 @@ from mcp_server_kafka.models import (
     ClusterInfo,
     PartitionInfo,
     ProduceResult,
+    SampledMessage,
     TopicDetail,
     TopicSummary,
 )
@@ -99,6 +101,44 @@ def _parse_topic_detail(raw_topic: Any) -> TopicDetail:
         is_internal=bool(getattr(raw_topic, "is_internal", False)),
         partitions=[_parse_partition_item(p) for p in getattr(raw_topic, "partitions", [])],
     )
+
+
+def _safe_decode_bytes(raw_bytes: bytes) -> str:
+    """安全解码字节流为 UTF-8 文本，失败时自动降级为 Base64 编码字符串.
+
+    @param raw_bytes 待解码字节流
+    @return 解码后的字符串
+    """
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return base64.b64encode(raw_bytes).decode("ascii")
+
+
+def decode_payload(raw_bytes: bytes | None) -> tuple[Any, str, int]:
+    """自适应反序列化原始消息载荷字节流.
+
+    优先尝试解析 UTF-8 JSON 结构化数据；若非合法 JSON 则保留为纯文本；
+    若包含无法解码的二进制字节流，则安全降级为 Base64 字符串.
+
+    @param raw_bytes 消息原始载荷字节流
+    @return (解码后对象或文本, 识别的编码类型, 原始字节大小)
+    """
+    if raw_bytes is None:
+        return None, "null", 0
+
+    size = len(raw_bytes)
+    try:
+        text = raw_bytes.decode("utf-8")
+        try:
+            parsed_json = json.loads(text)
+            return parsed_json, "json", size
+        except (json.JSONDecodeError, ValueError):
+            return text, "text", size
+    except UnicodeDecodeError:
+        b64_str = base64.b64encode(raw_bytes).decode("ascii")
+        return b64_str, "base64", size
+
 
 
 class KafkaManager:
@@ -342,3 +382,140 @@ class KafkaManager:
             timestamp=record_meta.timestamp,
             key=key,
         )
+
+    @staticmethod
+    def build_sampled_message(
+        partition: int,
+        offset: int,
+        timestamp: int | None,
+        key: bytes | str | None,
+        raw_value: bytes | None,
+        headers: dict[str, str] | list[tuple[str, bytes]] | None = None,
+    ) -> SampledMessage:
+        """构建自适应反序列化后的采样消息实体.
+
+        @param partition 分区编号
+        @param offset 消息位移
+        @param timestamp 时间戳
+        @param key 消息键
+        @param raw_value 原始消息载荷字节
+        @param headers 消息标头
+        @return 结构化采样消息实体
+        """
+        # 1. 解码消息键
+        key_str: str | None = None
+        if key is not None:
+            key_str = key if isinstance(key, str) else _safe_decode_bytes(key)
+
+        # 2. 自适应解码载荷
+        decoded_val, encoding, size = decode_payload(raw_value)
+
+        # 3. 整理标头键值对
+        headers_dict: dict[str, str] = {}
+        if isinstance(headers, dict):
+            headers_dict = headers
+        elif isinstance(headers, (list, tuple)):
+            for item in headers:
+                if len(item) >= 2:
+                    k, v = item[0], item[1]
+                    v_str = _safe_decode_bytes(v) if isinstance(v, bytes) else str(v)
+                    headers_dict[str(k)] = v_str
+
+        return SampledMessage(
+            partition=partition,
+            offset=offset,
+            timestamp=timestamp,
+            key=key_str,
+            value=decoded_val,
+            headers=headers_dict,
+            size=size,
+            encoding=encoding,
+        )
+
+    def create_consumer(self) -> AIOKafkaConsumer:
+        """创建瞬态采样消费者实例 (强制关闭自动提交且无消费组).
+
+        @return 配置好的 AIOKafkaConsumer 实例
+        """
+        return AIOKafkaConsumer(
+            bootstrap_servers=self._config.bootstrap_servers,
+            enable_auto_commit=False,
+            group_id=None,
+        )
+
+    async def sample_messages(
+        self,
+        topic: str,
+        partition: int | None = None,
+        strategy: str = "latest",
+        offset: int | None = None,
+        limit: int = 10,
+    ) -> list[SampledMessage]:
+        """以零提交位移瞬态方式采样拉取主题消息.
+
+        @param topic 目标主题名称
+        @param partition 可选指定分区号
+        @param strategy 采样策略 (latest / earliest / offset)
+        @param offset 策略为 offset 时的起始数值
+        @param limit 采样条数限制 (上限 100)
+        @return 采样消息列表
+        """
+        effective_limit = min(max(limit, 1), 100)
+        consumer = self.create_consumer()
+        await consumer.start()
+        try:
+            # 1. 确定并分配分区
+            if partition is not None:
+                assigned_partitions = [TopicPartition(topic, partition)]
+            else:
+                topic_detail = await self.describe_topic(topic)
+                assigned_partitions = [
+                    TopicPartition(topic, p.partition_id) for p in topic_detail.partitions
+                ]
+
+            if not assigned_partitions:
+                return []
+
+            consumer.assign(assigned_partitions)
+
+            # 2. 依照策略定位起始位移
+            if strategy == "earliest":
+                await consumer.seek_to_beginning(*assigned_partitions)
+            elif strategy == "offset" and offset is not None:
+                for tp in assigned_partitions:
+                    consumer.seek(tp, offset)
+            else:
+                end_offsets = await consumer.end_offsets(assigned_partitions)
+                for tp in assigned_partitions:
+                    end_off = end_offsets.get(tp, 0)
+                    start_off = max(0, end_off - effective_limit)
+                    consumer.seek(tp, start_off)
+
+            # 3. 瞬态拉取并解码
+            raw_batches = await consumer.getmany(
+                *assigned_partitions,
+                timeout_ms=3000,
+                max_records=effective_limit,
+            )
+            sampled: list[SampledMessage] = []
+            for tp_records in raw_batches.values():
+                for record in tp_records:
+                    sampled.append(
+                        self.build_sampled_message(
+                            partition=record.partition,
+                            offset=record.offset,
+                            timestamp=record.timestamp,
+                            key=record.key,
+                            raw_value=record.value,
+                            headers=record.headers,
+                        )
+                    )
+                    if len(sampled) >= effective_limit:
+                        break
+                if len(sampled) >= effective_limit:
+                    break
+
+            return sampled
+        finally:
+            await consumer.stop()
+

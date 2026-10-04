@@ -4,6 +4,8 @@
 @since 2026-10-04
 """
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -94,3 +96,23 @@ class ProduceResult(BaseModel):
     offset: int = Field(description="写入成功分配的位移编号")
     timestamp: int | None = Field(default=None, description="消息写入时间戳 (毫秒)")
     key: str | None = Field(default=None, description="消息键")
+
+
+class SampledMessage(BaseModel):
+    """采样读取的 Kafka 消息实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    partition: int = Field(description="消息所在物理分区编号")
+    offset: int = Field(description="消息物理位移编号")
+    timestamp: int | None = Field(default=None, description="消息时间戳 (毫秒)")
+    key: str | None = Field(default=None, description="消息键 (UTF-8 文本或 Base64)")
+    value: Any = Field(default=None, description="反序列化后的消息载荷 (JSON 对象/文本/Base64)")
+    headers: dict[str, str] = Field(default_factory=dict, description="消息标头键值对")
+    size: int = Field(default=0, description="原始载荷字节大小")
+    encoding: str = Field(default="text", description="载荷编码识别类型 (json / text / base64 / null)")
+

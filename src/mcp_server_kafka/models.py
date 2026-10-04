@@ -116,3 +116,69 @@ class SampledMessage(BaseModel):
     size: int = Field(default=0, description="原始载荷字节大小")
     encoding: str = Field(default="text", description="载荷编码识别类型 (json / text / base64 / null)")
 
+
+class ConsumerGroupSummary(BaseModel):
+    """Kafka 消费组列表摘要实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    group_id: str = Field(description="消费组唯一标识符 ID")
+    protocol_type: str = Field(default="", description="协议类型 (例如 consumer)")
+    state: str = Field(default="Unknown", description="消费组状态 (例如 Stable, Empty, Dead 等)")
+
+
+class ConsumerGroupMember(BaseModel):
+    """Kafka 消费组活跃成员实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    member_id: str = Field(description="消费者成员唯一标识符")
+    client_id: str = Field(description="客户端 ID")
+    client_host: str = Field(description="客户端主机 IP 或主机名")
+    partitions: list[dict[str, Any]] = Field(default_factory=list, description="分配给该成员的主题与分区列表")
+
+
+class PartitionLag(BaseModel):
+    """Kafka 主题分区位移与积压实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    topic: str = Field(description="主题名称")
+    partition: int = Field(description="物理分区编号")
+    committed_offset: int | None = Field(default=None, description="消费组已提交位移")
+    log_end_offset: int | None = Field(default=None, description="分区最新日志末端位移 (LEO)")
+    lag: int | None = Field(default=None, description="当前分区积压消息条数")
+    member_id: str | None = Field(default=None, description="当前负责消费该分区的活跃成员 ID")
+    topic_deleted: bool = Field(default=False, description="主题是否已在集群中删除")
+
+
+class ConsumerGroupDetail(BaseModel):
+    """Kafka 消费组拓扑详情与积压实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    group_id: str = Field(description="消费组唯一标识符 ID")
+    state: str = Field(default="Unknown", description="消费组当前状态")
+    protocol_type: str = Field(default="", description="协议类型")
+    protocol: str = Field(default="", description="分区分配策略 (例如 range, roundrobin)")
+    members: list[ConsumerGroupMember] = Field(default_factory=list, description="当前活跃成员列表")
+    partitions: list[PartitionLag] = Field(default_factory=list, description="各主题分区位移与积压分布明细")
+    total_lag: int = Field(default=0, description="消费组在全部有效分区上的总积压消息条数")
+
+

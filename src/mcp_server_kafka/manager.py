@@ -7,21 +7,29 @@
 import asyncio
 import base64
 import json
+import logging
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.coordinator.protocol import ConsumerProtocolMemberAssignment
 
 from mcp_server_kafka.config import KafkaConfig
 from mcp_server_kafka.models import (
     BrokerInfo,
     ClusterInfo,
+    ConsumerGroupDetail,
+    ConsumerGroupMember,
+    ConsumerGroupSummary,
     PartitionInfo,
+    PartitionLag,
     ProduceResult,
     SampledMessage,
     TopicDetail,
     TopicSummary,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_broker_item(raw_broker: Any) -> BrokerInfo:
@@ -518,4 +526,278 @@ class KafkaManager:
             return sampled
         finally:
             await consumer.stop()
+
+    async def list_consumer_groups(self) -> list[ConsumerGroupSummary]:
+        """列出集群所有消费组摘要信息.
+
+        @return 消费组摘要模型列表
+        """
+        # 1. 查询集群中所有消费组基础清单
+        admin = await self.get_admin_client()
+        raw_groups = await admin.list_consumer_groups()
+        if not raw_groups:
+            return []
+
+        group_ids: list[str] = []
+        parsed_groups: list[tuple[str, str]] = []
+        for item in raw_groups:
+            if isinstance(item, (tuple, list)):
+                gid = str(item[0]) if len(item) > 0 else ""
+                proto = str(item[1]) if len(item) > 1 else ""
+            elif isinstance(item, dict):
+                gid = str(item.get("group_id") or item.get("group") or "")
+                proto = str(item.get("protocol_type", ""))
+            else:
+                gid = str(getattr(item, "group_id", getattr(item, "group", "")))
+                proto = str(getattr(item, "protocol_type", ""))
+            if gid:
+                group_ids.append(gid)
+                parsed_groups.append((gid, proto))
+
+        if not group_ids:
+            return []
+
+        # 2. 批量获取消费组当前状态 (如 Stable, Empty, Dead)
+        state_map: dict[str, str] = {}
+        try:
+            desc_responses = await admin.describe_consumer_groups(group_ids)
+            for resp in desc_responses:
+                groups_list = (
+                    resp.groups
+                    if hasattr(resp, "groups")
+                    else (resp.get("groups", []) if isinstance(resp, dict) else [])
+                )
+                for g in groups_list:
+                    if isinstance(g, (tuple, list)) and len(g) >= 3:
+                        err, g_name, st = g[0], g[1], g[2]
+                        if err == 0:
+                            state_map[str(g_name)] = str(st)
+                    elif isinstance(g, dict):
+                        if g.get("error_code", 0) == 0 and "group" in g:
+                            state_map[str(g["group"])] = str(g.get("state", "Unknown"))
+                    elif hasattr(g, "group") and getattr(g, "error_code", 0) == 0:
+                        state_map[str(g.group)] = str(getattr(g, "state", "Unknown"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("批量查询消费组状态异常，回退默认状态: %s", exc)
+
+        # 3. 构造并返回消费组摘要实体列表
+        summaries: list[ConsumerGroupSummary] = []
+        for gid, proto in parsed_groups:
+            st = state_map.get(gid, "Unknown")
+            summaries.append(ConsumerGroupSummary(group_id=gid, protocol_type=proto, state=st))
+        return summaries
+
+    async def describe_consumer_group(self, group_id: str) -> ConsumerGroupDetail:
+        """查询指定消费组详情，包括活跃成员分配与各分区 Lag 积压.
+
+        @param group_id 目标消费组唯一标识 ID
+        @return 结构化消费组详情模型
+        @throws ValueError 当消费组不存在或查询返回错误码时抛出
+        """
+        # 1. 查询消费组状态与成员信息
+        admin = await self.get_admin_client()
+        desc_responses = await admin.describe_consumer_groups([group_id])
+
+        target_group = None
+        for resp in desc_responses:
+            groups_list = (
+                resp.groups
+                if hasattr(resp, "groups")
+                else (resp.get("groups", []) if isinstance(resp, dict) else [])
+            )
+            for g in groups_list:
+                g_id = (
+                    g[1]
+                    if isinstance(g, (tuple, list)) and len(g) > 1
+                    else (g.get("group") if isinstance(g, dict) else getattr(g, "group", None))
+                )
+                if g_id == group_id:
+                    target_group = g
+                    break
+            if target_group is not None:
+                break
+
+        if target_group is None:
+            raise ValueError(f"消费组 '{group_id}' 不存在或查询失败")
+
+        if isinstance(target_group, (tuple, list)):
+            err_code = target_group[0] if len(target_group) > 0 else 0
+            state = str(target_group[2]) if len(target_group) > 2 else "Unknown"
+            protocol_type = str(target_group[3]) if len(target_group) > 3 else ""
+            protocol = str(target_group[4]) if len(target_group) > 4 else ""
+            raw_members = target_group[5] if len(target_group) > 5 else []
+        elif isinstance(target_group, dict):
+            err_code = target_group.get("error_code", 0)
+            state = str(target_group.get("state", "Unknown"))
+            protocol_type = str(target_group.get("protocol_type", ""))
+            protocol = str(target_group.get("protocol", ""))
+            raw_members = target_group.get("members", [])
+        else:
+            err_code = getattr(target_group, "error_code", 0)
+            state = str(getattr(target_group, "state", "Unknown"))
+            protocol_type = str(getattr(target_group, "protocol_type", ""))
+            protocol = str(getattr(target_group, "protocol", ""))
+            raw_members = getattr(target_group, "members", [])
+
+        if err_code != 0:
+            raise ValueError(f"消费组 '{group_id}' 查询返回错误码: {err_code}")
+
+        # 2. 解析活跃成员与分区分配关系
+        member_entities: list[ConsumerGroupMember] = []
+        member_by_tp: dict[TopicPartition, str] = {}
+        assigned_tps_from_members: set[TopicPartition] = set()
+
+        for m in raw_members:
+            if isinstance(m, (tuple, list)):
+                mid = str(m[0]) if len(m) > 0 else ""
+                cid = str(m[1]) if len(m) > 1 else ""
+                chost = str(m[2]) if len(m) > 2 else ""
+                massign = m[4] if len(m) > 4 else b""
+            elif isinstance(m, dict):
+                mid = str(m.get("member_id", ""))
+                cid = str(m.get("client_id", ""))
+                chost = str(m.get("client_host", ""))
+                massign = m.get("member_assignment", b"")
+            else:
+                mid = str(getattr(m, "member_id", ""))
+                cid = str(getattr(m, "client_id", ""))
+                chost = str(getattr(m, "client_host", ""))
+                massign = getattr(m, "member_assignment", b"")
+
+            m_partitions: list[dict[str, Any]] = []
+            if massign and isinstance(massign, (bytes, bytearray)):
+                try:
+                    decoded_assign = ConsumerProtocolMemberAssignment.decode(massign)
+                    for tp in decoded_assign.partitions():
+                        m_partitions.append({"topic": tp.topic, "partition": tp.partition})
+                        member_by_tp[tp] = mid
+                        assigned_tps_from_members.add(tp)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("解码成员 [%s] 分区分配字节流失败: %s", mid, exc)
+            elif isinstance(massign, list):
+                for item in massign:
+                    if isinstance(item, TopicPartition):
+                        m_partitions.append({"topic": item.topic, "partition": item.partition})
+                        member_by_tp[item] = mid
+                        assigned_tps_from_members.add(item)
+                    elif isinstance(item, dict):
+                        tp_obj = TopicPartition(item["topic"], int(item["partition"]))
+                        m_partitions.append({"topic": tp_obj.topic, "partition": tp_obj.partition})
+                        member_by_tp[tp_obj] = mid
+                        assigned_tps_from_members.add(tp_obj)
+
+            member_entities.append(
+                ConsumerGroupMember(
+                    member_id=mid,
+                    client_id=cid,
+                    client_host=chost,
+                    partitions=m_partitions,
+                )
+            )
+
+        # 3. 查询消费组已提交位移
+        committed_offsets_map: dict[TopicPartition, int | None] = {}
+        try:
+            offsets_resp = await admin.list_consumer_group_offsets(group_id)
+            for tp, offset_meta in offsets_resp.items():
+                if offset_meta is not None and getattr(offset_meta, "offset", -1) >= 0:
+                    committed_offsets_map[tp] = offset_meta.offset
+                else:
+                    committed_offsets_map[tp] = None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询消费组 [%s] 提交位移失败: %s", group_id, exc)
+
+        # 4. 汇总全量涉及的分区并进行现存主题防御过滤
+        all_tps: set[TopicPartition] = set(committed_offsets_map.keys()) | assigned_tps_from_members
+        existing_topics = await self.list_topics(include_internal=True)
+        existing_topic_names = {t.name for t in existing_topics}
+
+        # 补充涉足主题的所有物理分区（覆盖尚未分配或尚未提交位移的新分区）
+        involved_topics = {tp.topic for tp in all_tps if tp.topic in existing_topic_names}
+        for top_name in involved_topics:
+            try:
+                t_detail = await self.describe_topic(top_name)
+                for part in t_detail.partitions:
+                    all_tps.add(TopicPartition(top_name, part.partition_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("获取主题 [%s] 物理分区扩展信息失败: %s", top_name, exc)
+
+        if not all_tps:
+            return ConsumerGroupDetail(
+                group_id=group_id,
+                state=state,
+                protocol_type=protocol_type,
+                protocol=protocol,
+                members=member_entities,
+                partitions=[],
+                total_lag=0,
+            )
+
+        # 5. 查询现存物理分区的日志末端位移 (LEO)
+        valid_tps = [tp for tp in all_tps if tp.topic in existing_topic_names]
+        deleted_tps = {tp for tp in all_tps if tp.topic not in existing_topic_names}
+
+        log_end_offsets_map: dict[TopicPartition, int] = {}
+        if valid_tps:
+            consumer = self.create_consumer()
+            await consumer.start()
+            try:
+                log_end_offsets_map = await consumer.end_offsets(valid_tps)
+            finally:
+                await consumer.stop()
+
+        # 6. 计算各分区精确 Lag 与汇总 Total Lag
+        partition_lags: list[PartitionLag] = []
+        total_lag: int = 0
+
+        for tp in sorted(all_tps, key=lambda x: (x.topic, x.partition)):
+            is_deleted = tp in deleted_tps
+            committed = committed_offsets_map.get(tp)
+            mid = member_by_tp.get(tp)
+
+            if is_deleted:
+                partition_lags.append(
+                    PartitionLag(
+                        topic=tp.topic,
+                        partition=tp.partition,
+                        committed_offset=committed,
+                        log_end_offset=None,
+                        lag=None,
+                        member_id=mid,
+                        topic_deleted=True,
+                    )
+                )
+            else:
+                end_offset = log_end_offsets_map.get(tp)
+                if end_offset is not None:
+                    if committed is not None and committed >= 0:
+                        calc_lag = max(0, end_offset - committed)
+                    else:
+                        calc_lag = end_offset
+                    total_lag += calc_lag
+                else:
+                    calc_lag = None
+
+                partition_lags.append(
+                    PartitionLag(
+                        topic=tp.topic,
+                        partition=tp.partition,
+                        committed_offset=committed,
+                        log_end_offset=end_offset,
+                        lag=calc_lag,
+                        member_id=mid,
+                        topic_deleted=False,
+                    )
+                )
+
+        return ConsumerGroupDetail(
+            group_id=group_id,
+            state=state,
+            protocol_type=protocol_type,
+            protocol=protocol,
+            members=member_entities,
+            partitions=partition_lags,
+            total_lag=total_lag,
+        )
+
 

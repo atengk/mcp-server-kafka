@@ -132,7 +132,45 @@ def create_mcp_server(
             logger.warning("采样 Kafka 消息失败 [topic=%s]: %s", topic, exc)
             return {"error": f"采样消息失败: {exc}"}
 
-    # 5. 注册写操作 Tools (双重安全防线之一：只读模式隐藏拦截)
+    # 5. 注册消费组列表查询 Tool
+    @server.tool(
+        name="kafka_list_consumer_groups",
+        description="列出 Kafka 集群中的消费组清单（包含 Group ID、协议类型与活跃状态如 Stable/Empty/Dead）",
+    )
+    async def kafka_list_consumer_groups() -> dict[str, Any]:
+        """列出 Kafka 集群中的消费组摘要信息.
+
+        @return 包含消费组清单 groups 与总数 count 的结果字典；失败时返回错误描述字典
+        """
+        try:
+            groups = await mgr.list_consumer_groups()
+            return {
+                "groups": [g.model_dump() for g in groups],
+                "count": len(groups),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("获取 Kafka 消费组列表失败: %s", exc)
+            return {"error": f"获取消费组列表失败: {exc}"}
+
+    # 6. 注册消费组详情与积压分析 Tool
+    @server.tool(
+        name="kafka_describe_consumer_group",
+        description="查询指定 Kafka 消费组的详细拓扑，包含活跃成员、分区 Committed Offset、LEO 及 Lag 积压数值",
+    )
+    async def kafka_describe_consumer_group(group_id: str) -> dict[str, Any]:
+        """查询指定 Kafka 消费组详细拓扑与分区积压.
+
+        @param group_id 目标消费组 ID
+        @return 包含活跃成员分配及各分区 Lag 积压明细的详情字典；失败时返回错误描述字典
+        """
+        try:
+            detail = await mgr.describe_consumer_group(group_id=group_id)
+            return detail.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询 Kafka 消费组详情失败 [group_id=%s]: %s", group_id, exc)
+            return {"error": f"查询消费组详情失败: {exc}"}
+
+    # 7. 注册写操作 Tools (双重安全防线之一：只读模式隐藏拦截)
     if not cfg.read_only:
 
         @server.tool(
@@ -219,7 +257,8 @@ def create_mcp_server(
                 logger.warning("生产 Kafka 消息失败 [topic=%s]: %s", topic, exc)
                 return {"error": f"发送消息失败: {exc}"}
 
-    # 5. 注册集群摘要 Resource
+
+    # 8. 注册集群摘要 Resource
     @server.resource(
         "kafka://cluster/summary",
         name="Kafka 集群拓扑摘要",
@@ -257,7 +296,7 @@ def create_mcp_server(
             logger.warning("读取 Kafka 集群摘要失败: %s", exc)
             return f"读取集群摘要失败: {exc}"
 
-    # 6. 注册指定主题动态 Resource
+    # 9. 注册指定主题动态 Resource
     @server.resource(
         "kafka://topics/{topic}",
         name="Kafka 主题拓扑与分区明细",
@@ -287,6 +326,45 @@ def create_mcp_server(
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取 Kafka 主题资源失败 [topic=%s]: %s", topic, exc)
             return f"读取主题 '{topic}' 详情失败: {exc}"
+
+    # 10. 注册消费组积压与故障诊断 Prompt
+    @server.prompt(
+        name="diagnose_topic_lag",
+        description="引导大模型对 Kafka 消费组滞后 (Lag) 进行深度根因分析与拓扑倾斜诊断",
+    )
+    def diagnose_topic_lag(group_id: str, topic: str | None = None) -> str:
+        """生成消费组积压与分区倾斜诊断引导提示词.
+
+        @param group_id 待诊断的 Kafka 消费组 ID
+        @param topic 可选的关注主题名称
+        @return 结构化诊断引导提示词
+        """
+        topic_clause = f"针对主题 `{topic}` " if topic else ""
+        topic_check = (
+            f"- 若需进一步验证主题分区副本健康度，调用 `kafka_describe_topic(topic_name='{topic}')` 检查 ISR 副本及 Leader 状态。"
+            if topic
+            else "- 若发现特定主题积压严重，调用 `kafka_describe_topic` 检查对应主题的分区副本健康度与 Leader 分布。"
+        )
+        return (
+            f"请对 Kafka 消费组 `{group_id}` {topic_clause}开展数据消费积压 (Lag) 与稳定性根因诊断。\n\n"
+            f"## 诊断排查步骤建议\n"
+            f"1. **调用工具获取最新现场数据**：\n"
+            f"   - 首先调用 `kafka_describe_consumer_group(group_id='{group_id}')` 获取当前消费组的最新状态、活跃成员列表、各分区已提交位移 (Committed Offset) 与日志末端位移 (Log End Offset)。\n"
+            f"   {topic_check}\n\n"
+            f"2. **多维根因分析与指标评估**：\n"
+            f"   - **积压总量与趋势**：评估 `total_lag` 规模，判断积压是否处于正常波动范围还是业务堆积失控。\n"
+            f"   - **分区倾斜诊断 (Partition Skew)**：对比各分区 Lag 数值。若个别分区 Lag 极高而其他分区接近 0，重点排查是否存在消息 Key 热点集中、特定分区消息体过大或消费端个别 Worker 线程卡死。\n"
+            f"   - **消费者活跃度与拓扑映射 (Consumer Dead / Starvation)**：\n"
+            f"     - 检查消费组状态是否为 `Stable`；若处于 `Empty` 或 `PreparingRebalance`/`CompletingRebalance`，排查客户端崩溃或网络抖动。\n"
+            f"     - 检查是否存在未分配给任何活跃成员的分区 (Member ID 为空)，判断是否发生成员下线或消费者数量少于分区数。\n"
+            f"   - **处理耗时与心跳超时 (Processing Delay & Rebalance)**：\n"
+            f"     - 结合位移差距推断业务处理速率；若客户端频繁重平衡，重点排查单批消息处理耗时是否超过 `max.poll.interval.ms`。\n\n"
+            f"3. **输出排查报告与治理建议**：\n"
+            f"   - **现状摘要**：消费组状态、总 Lag、涉及主题与分区数。\n"
+            f"   - **风险等级**：健康 (正常) / 预警 (倾斜或轻微积压) / 严重 (消费者宕机或海量积压)。\n"
+            f"   - **核心疑点与根因推断**：列出最可能的故障点。\n"
+            f"   - **行动建议**：给出具体处置方案（如横向扩容消费者实例、按 Key 散列重分区、调优 `max.poll.records`、排查下游数据库慢查询等）。"
+        )
 
     return server
 

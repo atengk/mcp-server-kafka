@@ -86,6 +86,47 @@
 
 ---
 
+### 4. 🧭 消费组位移治理与回溯实操指南 (`kafka_reset_consumer_group_offsets`)
+
+`kafka_reset_consumer_group_offsets` 是针对线上故障快速止血、历史数据补录或逻辑修复回溯设计的企业级运维工具。为了杜绝大模型误操作引发重复消费风暴或数据丢失，设计了**严密的三级纵深防线**：
+
+```
+                    ┌──────────────────────────────────────────────┐
+                    │  kafka_reset_consumer_group_offsets 工具调用  │
+                    └──────────────────────┬───────────────────────┘
+                                           │
+                                ┌──────────┴──────────┐
+                     [dry_run=True (默认)]      [dry_run=False (执行)]
+                                │                         │
+                        只读试运行模拟             是否显式 confirm=True?
+                        计算 Lag / 变更前后              ├── 否 ──> 抛出 ValueError 拦截
+                                │                         └── 是
+                        安全返回预检报告 (无写入)                  │
+                                                   消费组是否处于 Stable 且存在活跃成员?
+                                                          ├── 是 ──> 是否 force=True?
+                                                          │            ├── 否 ──> 拦截拒绝 (防止状态冲突)
+                                                          │            └── 是 ──> 物理提交位移
+                                                          └── 否 ──> 物理提交位移并返回结果
+```
+
+#### A. 四大重置策略
+- **`earliest`**：回滚至最早可用位移（用于数据全量重新消费）；
+- **`latest`**：跳跃至最新分区末端位移（用于故障积压直接跳过、快速追齐实时数据）；
+- **`to_offset`**：指定具体的绝对位移数值（需配合 `offset` 参数）；
+- **`to_datetime`**：回溯至指定历史时间点（配合 `datetime_val`，支持 ISO-8601 字符串如 `"2026-10-04T12:00:00+08:00"` 或毫秒时间戳如 `1791100000000`）。
+
+#### B. 标准运维实操工作流
+1. **阶段 1：预检评估 (Dry-Run)**  
+   默认 `dry_run=True`，服务端仅查询当前 Committed Offset、目标 New Offset 与预计 Lag 变动，**绝对不向 Kafka 提交任何位移**：
+   > *“帮我预检一下将 order-group 消费组在 order-events 主题上的位移重置到 2026-10-04 12:00:00 的效果。”*
+2. **阶段 2：人工审查确认后物理提交**  
+   审查预检报告确认无误后，显式传入 `dry_run=False, confirm=True` 完成物理提交：
+   > *“确认预检结果符合预期，请正式执行位移重置 (confirm=True)。”*
+3. **阶段 3：活跃消费组状态冲突防御**  
+   若消费组当前存在在线活跃消费者实例（`state="Stable"` 且成员数 $>0$），直接重置位移将被在线客户端后续心跳与提交覆盖。工具默认会拦截并返回防御警示；若确认属于应急处置，可显式追加 `force=True` 强制放行。
+
+---
+
 ## ⚙️ 运行时配置与参数清单
 
 服务配置优先遵循：**命令行参数 > 环境变量 > 预设默认值**。
@@ -95,10 +136,33 @@
 | `-c, --config` | `MCP_KAFKA_CONFIG` | 无 | 多集群命名连接 YAML 配置文件路径（指定后启用多集群模式） |
 | `--bootstrap-servers` | `MCP_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | 单集群模式 Broker 引导地址（未指定配置文件时生效，多个逗号分隔） |
 | `--read-only` | `MCP_KAFKA_READ_ONLY` | `false` | 全局只读防线开关，开启后拒绝并隐藏一切写操作 |
+| `--security-protocol` | `MCP_KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | 底层通信安全协议 (`PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`) |
+| `--sasl-mechanism` | `MCP_KAFKA_SASL_MECHANISM` | `PLAIN` | SASL 认证机制 (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` 等) |
+| `--sasl-username` | `MCP_KAFKA_SASL_USERNAME` | 无 | SASL 身份认证用户名 / AccessKey |
+| `--sasl-password` | `MCP_KAFKA_SASL_PASSWORD` | 无 | SASL 身份认证密码 / SecretKey |
+| `--ssl-cafile` | `MCP_KAFKA_SSL_CAFILE` | 无 | SSL 根证书 CA 路径 (`.pem` / `.crt`)，用于校验 Broker 服务端证书 |
+| `--ssl-certfile` | `MCP_KAFKA_SSL_CERTFILE` | 无 | mTLS 双向认证客户端证书路径 |
+| `--ssl-keyfile` | `MCP_KAFKA_SSL_KEYFILE` | 无 | mTLS 双向认证客户端私钥路径 |
 | `--transport` | `MCP_KAFKA_TRANSPORT` | `stdio` | 传输协议网关类型：`stdio`（管道）或 `sse`（HTTP） |
 | `--host` | `MCP_KAFKA_SERVER_HOST` | `0.0.0.0` | HTTP SSE 模式监听主机地址 |
 | `--port` | `MCP_KAFKA_SERVER_PORT` | `8000` | HTTP SSE 模式监听端口号 |
 | `--log-level` | `MCP_KAFKA_LOG_LEVEL` | `INFO` | 服务日志级别 (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### 🔐 企业级安全认证协议指南 (SASL / SSL / mTLS)
+
+服务端对企业私有云与公有云托管 Kafka 提供了完备的安全认证矩阵支持：
+
+1. **协议支持矩阵**：
+   - **`PLAINTEXT`**：内网非加密通信（默认）；
+   - **`SASL_SSL` (主流云厂商标准)**：传输层 TLS 加密 + 身份认证，广泛应用于阿里云云消息队列 Kafka、AWS MSK、华为云及 Confluent Cloud；
+   - **`SASL_PLAINTEXT`**：内网环境仅身份认证、明文数据传输；
+   - **`SSL` (mTLS 双向证书)**：金融与高保密专网环境下，基于客户端与服务端双向数字证书完成认证。
+2. **凭据安全与环境变量插值最佳实践**：
+   为防止在版本控制代码库（如 Git）或本地 JSON 配置中硬编码敏感账密，服务端内建了 `${ENV_VAR}` 动态插值解析引擎。无论在 CLI 还是 `connections.yaml` 中，均建议使用环境变量注入：
+   ```bash
+   export KAFKA_SASL_USER="my_access_key"
+   export KAFKA_SASL_PASS="my_secret_token"
+   ```
 
 ---
 
@@ -210,23 +274,37 @@
 }
 ```
 
-> **配置文件模板 (`connections.yaml`)**：
+> **企业级多环境配置文件模板 (`connections.yaml`)**：
 > ```yaml
 > default_connection: "default"
 > read_only: false
 > 
 > connections:
+>   # 1. 本地开发环境：单机无密通信
 >   default:
 >     bootstrap_servers: "localhost:9092"
 >     read_only: false
->   staging:
->     bootstrap_servers: "kafka-staging-1.internal:9092,kafka-staging-2.internal:9092"
+> 
+>   # 2. 云端托管集群：SASL_SSL 加密认证 (环境变量动态插值，防凭据泄露)
+>   cloud_sasl:
+>     bootstrap_servers: "alikafka-pre-cn-xxxx.kafka.aliyuncs.com:9093"
+>     security_protocol: "SASL_SSL"
+>     sasl_mechanism: "SCRAM-SHA-256"
+>     sasl_username: "${KAFKA_SASL_USER}"
+>     sasl_password: "${KAFKA_SASL_PASSWORD}"
+>     ssl_cafile: "/etc/ssl/certs/kafka-ca.pem"
 >     read_only: false
->   production:
->     bootstrap_servers: "kafka-prod-1.internal:9092,kafka-prod-2.internal:9092"
->     read_only: true  # 生产连接细粒度强制只读
+> 
+>   # 3. 核心生产集群：mTLS 双向证书通信 + 细粒度只读写保护
+>   production_mtls:
+>     bootstrap_servers: "kafka-prod-1.internal:9093,kafka-prod-2.internal:9093"
+>     security_protocol: "SSL"
+>     ssl_cafile: "./certs/ca.pem"
+>     ssl_certfile: "./certs/client.cer"
+>     ssl_keyfile: "./certs/client.key"
+>     read_only: true  # 生产实例强制连接级写保护
 > ```
-> 此时所有工具均支持可选传入 `connection: "staging"` 或 `connection: "production"`。若未传参则自动使用 `default_connection`。可调用 `kafka_list_connections` 查询当前所有已连接的集群清单。
+> 此时所有工具均支持可选传入 `connection: "cloud_sasl"` 或 `connection: "production_mtls"`。若未传参则自动使用 `default_connection`。可调用 `kafka_list_connections` 查询当前所有已连接的集群清单及其安全协议。
 
 ---
 
@@ -270,6 +348,24 @@ curl -I http://localhost:8000/sse
 - **场景 4：多集群/多环境同时连接（Dev / Staging / Prod 并存）**
   - **方式 A（多连接配置模式，推荐）**：启动单进程并通过 `--config connections.yaml` 挂载多集群，在对话中直接告知 AI：“查看 staging 集群的主题列表，并排查 production 集群的消费积压”；
   - **方式 B（多 Server 实例模式）**：在 MCP 配置中配置多个命名服务（如 `"kafka-dev"` 与 `"kafka-prod"`），分别传入各自的连接地址与参数。
+- **场景 5：连接公有云/云托管 Kafka（阿里云/AWS MSK/华为云，SASL_SSL + SCRAM）**
+  ```bash
+  uvx atengk-mcp-server-kafka \
+    --bootstrap-servers "alikafka-pre-cn-xxxx.kafka.aliyuncs.com:9093" \
+    --security-protocol SASL_SSL \
+    --sasl-mechanism SCRAM-SHA-256 \
+    --sasl-username "$KAFKA_USER" \
+    --sasl-password "$KAFKA_PASSWORD"
+  ```
+- **场景 6：连接内网双向证书认证集群 (mTLS / SSL)**
+  ```bash
+  uvx atengk-mcp-server-kafka \
+    --bootstrap-servers "kafka-broker-1:9093" \
+    --security-protocol SSL \
+    --ssl-cafile "./ca.pem" \
+    --ssl-certfile "./client.cer" \
+    --ssl-keyfile "./client.key"
+  ```
 
 ---
 
@@ -283,6 +379,12 @@ curl -I http://localhost:8000/sse
 
 > **Q3：为什么工具列表中没有主题创建、删除或消息发送工具？**  
 > **A**：这是服务端的**全局只读安全防线**。当开启了 `--read-only` 或设置了 `MCP_KAFKA_READ_ONLY=true` 时，所有破坏性与写操作工具将自动隐藏并拒绝执行，确保生产集群安全。若确需写权限，移除该参数重新启动即可。
+
+> **Q4：调用 `kafka_reset_consumer_group_offsets` 报错消费组处于活跃状态冲突？**  
+> **A**：这是服务端的**活跃组防并发覆盖防线**。当消费组处于 `Stable` 状态且成员数 $>0$ 时，在线客户端会定时提交位移，覆盖重置结果。最佳实践是先停止消费端实例；若属于紧急运维且确认要强行覆盖，可在确认后传入 `force=True` 放行。
+
+> **Q5：如何在多环境配置中防范 SASL 账密明文泄露？**  
+> **A**：服务端支持 `${ENV_VAR}` 语法动态插值。在 `connections.yaml` 中将敏感字段写作 `sasl_username: "${KAFKA_USER}"` 与 `sasl_password: "${KAFKA_PASSWORD}"`，启动前在宿主系统中 export 对应环境变量即可，杜绝明文入库。
 
 ---
 
@@ -314,7 +416,7 @@ uv run ruff check .
 │   │   └── release.yml           # 自动化发版与多架构 GHCR 镜像构建
 │   └── PULL_REQUEST_TEMPLATE.md
 ├── docs/                         # 工程架构决策与领域文档
-│   ├── adr/                      # 架构决策记录 (ADR 0001 ~ 0004)
+│   ├── adr/                      # 架构决策记录 (ADR 0001 ~ 0005)
 │   └── spec/                     # 核心需求规格说明书
 ├── src/                          # 核心源码目录
 │   └── mcp_server_kafka/
@@ -331,6 +433,7 @@ uv run ruff check .
 │   ├── test_message_produce.py   # 消息安全生产与序列化测试
 │   ├── test_message_sampling.py  # 零位移消息采样与自适应解码测试
 │   ├── test_multi_cluster_connections.py # 多集群命名连接与路由测试
+│   ├── test_security_and_offset_reset.py # 企业级安全与位移重置治理测试
 │   ├── test_topic_tools.py       # 主题生命周期与安全防线测试
 │   └── test_transport_and_gateway.py # Stdio/SSE 双模网关调度测试
 ├── connections.example.yaml      # 多集群多环境连接配置文件模板

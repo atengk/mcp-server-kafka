@@ -90,40 +90,40 @@
 
 ---
 
-## 🚀 接入与部署指南
+## 🚀 客户端极速接入与配置指南
 
-### 1. 本地安装与开发
+### 1. 客户端配置文件路径速查
 
-推荐使用极速包管理器 [uv](https://docs.astral.sh/uv/)：
+在接入前，请先找到你正在使用的 AI 客户端对应的 MCP 配置文件路径：
 
-```bash
-# 克隆仓库
-git clone https://github.com/atengk/mcp-server-kafka.git
-cd mcp-server-kafka
+| 客户端 | 操作系统 | 配置文件路径 |
+| :--- | :--- | :--- |
+| **Claude Desktop** | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop** | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **Cursor** | macOS / Windows / Linux | 项目根目录 `.cursor/mcp.json` 或 `Settings -> Features -> MCP Servers` |
+| **VS Code (Cline)** | macOS / Windows / Linux | 插件面板设置中的 `cline_mcp_settings.json` |
+| **VS Code (Roo Code)**| macOS / Windows / Linux | 插件面板设置中的 `roo_cline_mcp_settings.json` |
+| **Windsurf** | macOS / Linux | `~/.codeium/windsurf/mcp_config.json` |
+| **Windsurf** | Windows | `%USERPROFILE%\.codeium\windsurf\mcp_config.json` |
 
-# 创建虚拟环境并同步全量依赖
-uv sync --all-extras
+---
 
-# 运行自动化测试与代码规范检查
-uv run pytest
-uv run ruff check .
-```
+### 2. 推荐接入方式一：使用 `uvx` 免安装开箱即用 (推荐)
 
-### 2. 客户端集成示例 (以 Claude Desktop 为例)
+无需手动克隆代码库或创建虚拟环境，只需安装了 [uv](https://docs.astral.sh/uv/) 工具链，客户端即可直接通过 `uvx` 命令一键拉取并拉起服务端进程。
 
-编辑 Claude Desktop 配置文件 `claude_desktop_config.json`：
+#### (1) Claude Desktop 配置示例
 
-#### 方案 A：通过 Stdio 标准管道连接（默认本地模式）
+在 `claude_desktop_config.json` 的 `mcpServers` 对象中追加如下配置：
 
 ```json
 {
   "mcpServers": {
     "kafka": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "--directory",
-        "/path/to/mcp-server-kafka",
-        "run",
+        "--from",
+        "git+https://github.com/atengk/mcp-server-kafka.git",
         "mcp-server-kafka",
         "--bootstrap-servers",
         "localhost:9092",
@@ -134,9 +134,84 @@ uv run ruff check .
 }
 ```
 
-#### 方案 B：连接常驻 HTTP SSE 服务网关
+> **提示**：若后续已发布至 PyPI，`args` 亦可精简为 `["mcp-server-kafka", "--bootstrap-servers", "localhost:9092", "--read-only"]`。
 
-若服务端已在容器或远端以 SSE 模式运行，客户端可直接配置 SSE URL：
+#### (2) Cursor 配置示例
+
+在项目根目录下创建 `.cursor/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "kafka": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/atengk/mcp-server-kafka.git",
+        "mcp-server-kafka",
+        "--bootstrap-servers",
+        "localhost:9092"
+      ]
+    }
+  }
+}
+```
+
+#### (3) VS Code (Cline / Roo Code) 配置示例
+
+在插件 MCP 设置中配置：
+
+```json
+{
+  "mcpServers": {
+    "kafka": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/atengk/mcp-server-kafka.git",
+        "mcp-server-kafka"
+      ],
+      "env": {
+        "MCP_KAFKA_BOOTSTRAP_SERVERS": "localhost:9092",
+        "MCP_KAFKA_READ_ONLY": "true"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+---
+
+### 3. 推荐接入方式二：Docker / Docker Compose 常驻容器网关 (HTTP SSE 模式)
+
+适合生产环境部署、团队共享公共网关或不想在本地宿主机安装 Python 环境的场景。服务端将以 HTTP SSE 模式监听并在后台常驻。
+
+#### (1) 一键启动服务端容器
+
+```bash
+# 方式 A：使用 docker run 启动（连接宿主机 Kafka 并开启只读防线）
+docker run -d \
+  --name mcp-server-kafka \
+  -p 8000:8000 \
+  -e MCP_KAFKA_BOOTSTRAP_SERVERS=host.docker.internal:9092 \
+  -e MCP_KAFKA_READ_ONLY=true \
+  ghcr.io/atengk/mcp-server-kafka:latest
+
+# 方式 B：使用 Docker Compose 启动
+docker compose up -d
+```
+
+服务启动后，可在宿主机执行快速健康检查：
+```bash
+# 验证 SSE 服务监听端点状态
+curl -I http://localhost:8000/sse
+```
+
+#### (2) 客户端连接常驻 SSE 网关
+
+任意支持 SSE 的 MCP 客户端均可直接配置远程 URL（以 Claude Desktop 为例）：
 
 ```json
 {
@@ -148,22 +223,120 @@ uv run ruff check .
 }
 ```
 
-### 3. Docker 与 Docker Compose 生产运行 (常驻 SSE 网关模式)
+---
 
-本项目镜像发布于 GitHub Container Registry (GHCR)：
+### 4. 其他接入方式
+
+#### 方式 A：通过 `pip` 或全局安装运行
+
+若已将包安装至系统全局或固定 Python 环境中：
 
 ```bash
-# 方式 A：使用 Docker Compose 一键启动常驻服务
-docker compose up -d
-
-# 方式 B：使用 docker run 启动
-docker run -d \
-  --name mcp-server-kafka \
-  -p 8000:8000 \
-  -e MCP_KAFKA_BOOTSTRAP_SERVERS=host.docker.internal:9092 \
-  -e MCP_KAFKA_READ_ONLY=true \
-  ghcr.io/atengk/mcp-server-kafka:latest
+# 安装
+pip install git+https://github.com/atengk/mcp-server-kafka.git
+# 或使用 uv tool 安装
+uv tool install git+https://github.com/atengk/mcp-server-kafka.git
 ```
+
+然后在客户端中直接调用全局入口命令 `mcp-server-kafka`：
+
+```json
+{
+  "mcpServers": {
+    "kafka": {
+      "command": "mcp-server-kafka",
+      "args": [
+        "--bootstrap-servers",
+        "localhost:9092"
+      ]
+    }
+  }
+}
+```
+
+#### 方式 B：源码克隆与本地二次开发
+
+```bash
+# 克隆源码并同步开发依赖
+git clone https://github.com/atengk/mcp-server-kafka.git
+cd mcp-server-kafka
+uv sync --all-extras
+
+# 运行全量单元测试与 Lint 门禁
+uv run pytest
+uv run ruff check .
+```
+
+客户端指定源码目录运行：
+
+```json
+{
+  "mcpServers": {
+    "kafka": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/绝对路径/mcp-server-kafka",
+        "run",
+        "mcp-server-kafka",
+        "--bootstrap-servers",
+        "localhost:9092"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### 5. 常见网络拓扑与最佳实践模板
+
+#### 场景 1：连接本机单机 Kafka（宿主机原生运行）
+```bash
+--bootstrap-servers localhost:9092
+```
+
+#### 场景 2：连接 Docker 内运行的 Kafka（容器与宿主机互通）
+若 Kafka 运行在 Docker 容器中且映射了端口 `9092:9092`：
+- 本地客户端运行模式：连接 `localhost:9092`
+- Docker 容器内运行 MCP 模式：连接 `host.docker.internal:9092`
+
+#### 场景 3：连接远程/生产环境多 Broker 高可用集群并启用只读安全防护
+```json
+{
+  "mcpServers": {
+    "kafka-prod": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/atengk/mcp-server-kafka.git",
+        "mcp-server-kafka",
+        "--bootstrap-servers",
+        "10.0.1.11:9092,10.0.1.12:9092,10.0.1.13:9092",
+        "--read-only",
+        "--log-level",
+        "WARNING"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### 6. ❓ 常见问题与排障 (FAQ)
+
+> **Q1：启动时报错 `command not found: uvx` 或提示找不到执行文件？**  
+> **A**：说明客户端桌面进程读取的系统环境变量 `PATH` 未包含 `uv` 所在的安装目录（例如 Windows 下 `%USERPROFILE%\.cargo\bin` 或 macOS/Linux 下 `~/.cargo/bin`）。可在客户端配置文件的 `"command"` 字段直接填入绝对路径，例如 Windows 下填入 `"C:\\Users\\<用户名>\\.cargo\\bin\\uvx.exe"`。
+
+> **Q2：连接报错 `ConnectionRefusedError` 或无法连通 Kafka？**  
+> **A**：
+> 1. 请检查 Kafka Broker 是否正常运行并监听指定端口；
+> 2. 检查 Kafka 的 `server.properties` 中的 `advertised.listeners` 配置，若监听在私有内网或容器内，需确保客户端宿主机有路由可达；
+> 3. 若使用 Docker 部署 MCP 连宿主机 Kafka，请配置为 `host.docker.internal:9092`。
+
+> **Q3：为什么工具列表中没有 `kafka_create_topic`、`kafka_delete_topic` 和 `kafka_produce_message`？**  
+> **A**：这是服务端的**一级安全防线**在生效！当开启了 `--read-only` 参数（或 `MCP_KAFKA_READ_ONLY=true`）时，所有写操作和具有破坏性的工具将被自动隐藏，确保 AI 模型只具备只读探查能力。若确需写权限，移除该参数重新启动即可。
 
 ---
 

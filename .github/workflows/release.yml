@@ -30,7 +30,8 @@ jobs:
       - name: 编译打包 Wheel 与源码包并计算校验和 (SHA-256)
         run: |
           uv build
-          cd dist && sha256sum * > checksums.txt
+          rm -f dist/.gitignore
+          cd dist && sha256sum *.whl *.tar.gz > checksums.txt
 
       - name: 生成发布日志 (基于 Commit 与 PR)
         uses: orhun/git-cliff-action@v4
@@ -48,7 +49,9 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            dist/*
+            dist/*.whl
+            dist/*.tar.gz
+            dist/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

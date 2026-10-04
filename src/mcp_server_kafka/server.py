@@ -148,6 +148,39 @@ def create_mcp_server(
                 logger.warning("删除 Kafka 主题失败 [topic=%s]: %s", topic_name, exc)
                 return {"error": f"删除主题失败: {exc}"}
 
+        @server.tool(
+            name="kafka_produce_message",
+            description="向指定 Kafka 主题发送消息（支持 Key、JSON/文本载荷与 Headers；只读模式下不可用）",
+        )
+        async def kafka_produce_message(
+            topic: str,
+            value: Any,
+            key: str | None = None,
+            partition: int | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> dict[str, Any]:
+            """向指定主题发送业务消息.
+
+            @param topic 目标主题名称
+            @param value 消息载荷内容 (支持字典、列表、字符串)
+            @param key 可选消息键
+            @param partition 可选指定目标分区编号
+            @param headers 可选自定义标头字典
+            @return 写入确认元数据字典；失败时返回错误描述字典
+            """
+            try:
+                res = await mgr.produce_message(
+                    topic=topic,
+                    value=value,
+                    key=key,
+                    partition=partition,
+                    headers=headers,
+                )
+                return res.model_dump()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("生产 Kafka 消息失败 [topic=%s]: %s", topic, exc)
+                return {"error": f"发送消息失败: {exc}"}
+
     # 5. 注册集群摘要 Resource
     @server.resource(
         "kafka://cluster/summary",

@@ -78,3 +78,19 @@ class TopicDetail(BaseModel):
     is_internal: bool = Field(default=False, description="是否为系统内部主题")
     partitions: list[PartitionInfo] = Field(default_factory=list, description="物理分区分布明细列表")
     configs: dict[str, str] = Field(default_factory=dict, description="主题自定义配置项键值对")
+
+
+class ProduceResult(BaseModel):
+    """Kafka 消息发送确认元数据实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    topic: str = Field(description="目标主题名称")
+    partition: int = Field(description="写入的目标分区编号")
+    offset: int = Field(description="写入成功分配的位移编号")
+    timestamp: int | None = Field(default=None, description="消息写入时间戳 (毫秒)")
+    key: str | None = Field(default=None, description="消息键")

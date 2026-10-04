@@ -5,8 +5,10 @@
 """
 
 import asyncio
+import json
 from typing import Any
 
+from aiokafka import AIOKafkaProducer
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 
 from mcp_server_kafka.config import KafkaConfig
@@ -14,6 +16,7 @@ from mcp_server_kafka.models import (
     BrokerInfo,
     ClusterInfo,
     PartitionInfo,
+    ProduceResult,
     TopicDetail,
     TopicSummary,
 )
@@ -114,6 +117,7 @@ class KafkaManager:
         """
         self._config = config
         self._admin_client: AIOKafkaAdminClient | None = None
+        self._producer: AIOKafkaProducer | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -138,12 +142,32 @@ class KafkaManager:
                 self._admin_client = client
         return self._admin_client
 
+    async def get_producer(self) -> AIOKafkaProducer:
+        """获取或惰性初始化 AIOKafkaProducer 实例.
+
+        @return 已启动的 AIOKafkaProducer 实例
+        """
+        if self._producer is not None:
+            return self._producer
+
+        async with self._lock:
+            if self._producer is None:
+                prod = AIOKafkaProducer(
+                    bootstrap_servers=self._config.bootstrap_servers,
+                )
+                await prod.start()
+                self._producer = prod
+        return self._producer
+
     async def close(self) -> None:
         """关闭所有底层活跃的 Kafka 客户端连接."""
         async with self._lock:
             if self._admin_client is not None:
                 await self._admin_client.close()
                 self._admin_client = None
+            if self._producer is not None:
+                await self._producer.stop()
+                self._producer = None
 
     async def get_cluster_metadata(self) -> ClusterInfo:
         """查询并构建集群元数据与 Broker 拓扑信息.
@@ -264,3 +288,57 @@ class KafkaManager:
         admin = await self.get_admin_client()
         await admin.delete_topics([topic_name])
         return {"topic": topic_name, "status": "deleted"}
+
+    async def produce_message(
+        self,
+        topic: str,
+        value: Any,
+        key: str | None = None,
+        partition: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> ProduceResult:
+        """向指定 Kafka 主题发送消息.
+
+        @param topic 目标主题名称
+        @param value 消息载荷 (支持字符串、字典、列表)
+        @param key 可选消息键
+        @param partition 可选指定分区号
+        @param headers 可选自定义标头字典
+        @return 发送确认元数据实体
+        """
+        # 1. 自适应编码消息载荷
+        if isinstance(value, (dict, list)):
+            value_bytes = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        elif isinstance(value, str):
+            value_bytes = value.encode("utf-8")
+        elif isinstance(value, bytes):
+            value_bytes = value
+        else:
+            value_bytes = str(value).encode("utf-8")
+
+        key_bytes = key.encode("utf-8") if isinstance(key, str) else None
+
+        # 2. 格式化标头列表
+        headers_list = (
+            [(k, v.encode("utf-8") if isinstance(v, str) else v) for k, v in headers.items()]
+            if headers
+            else None
+        )
+
+        # 3. 发送并等待 Broker 确认
+        producer = await self.get_producer()
+        record_meta = await producer.send_and_wait(
+            topic=topic,
+            value=value_bytes,
+            key=key_bytes,
+            partition=partition,
+            headers=headers_list,
+        )
+
+        return ProduceResult(
+            topic=record_meta.topic,
+            partition=record_meta.partition,
+            offset=record_meta.offset,
+            timestamp=record_meta.timestamp,
+            key=key,
+        )

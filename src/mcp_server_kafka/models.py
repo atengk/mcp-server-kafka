@@ -115,6 +115,8 @@ class SampledMessage(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict, description="消息标头键值对")
     size: int = Field(default=0, description="原始载荷字节大小")
     encoding: str = Field(default="text", description="载荷编码识别类型 (json / text / base64 / null)")
+    truncated: bool = Field(default=False, description="消息体是否因超过安全阈值而被截断")
+    original_size_bytes: int | None = Field(default=None, description="原始未截断消息载荷的完整字节数")
 
 
 class ConsumerGroupSummary(BaseModel):

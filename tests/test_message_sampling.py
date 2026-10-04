@@ -236,3 +236,38 @@ async def test_tool_sample_limit_constraint() -> None:
     data: dict[str, Any] = json.loads(result.content[0].text)
     assert data["total"] == 100
     assert len(data["messages"]) == 100
+
+
+@pytest.mark.asyncio
+async def test_tool_sample_large_message_truncation() -> None:
+    """验证单条超大消息载荷触发消息截断熔断保护 (Message Truncation Guard)."""
+    manager = StubbedConsumerKafkaManager()
+    # 模拟 100KB 的超大文本消息
+    large_payload = ("A" * 1000) * 100  # 100,000 bytes
+    manager.fake_consumer.records_to_return = [
+        FakeConsumerRecord(
+            partition=0,
+            offset=500,
+            value=large_payload.encode("utf-8"),
+        )
+    ]
+    server = create_mcp_server(KafkaConfig(), manager=manager)
+
+    # 1. 指定 max_bytes_per_message 为 2048 字节
+    result = await server.call_tool(
+        "kafka_sample_messages",
+        {
+            "topic": "large-topic",
+            "limit": 1,
+            "max_bytes_per_message": 2048,
+        },
+    )
+    assert result.is_error is False
+
+    data: dict[str, Any] = json.loads(result.content[0].text)
+    msg = data["messages"][0]
+    assert msg["truncated"] is True
+    assert msg["original_size_bytes"] == 100000
+    assert msg["size"] == 2048
+    assert len(msg["value"]) == 2048
+    assert msg["encoding"] == "text"

@@ -65,10 +65,10 @@
 | `kafka_create_topic` | 创建新主题 | `topic_name`, `partitions`, `replication_factor`, `connection` | 只读模式或生产连接下自动拦截 |
 | `kafka_delete_topic` | 删除指定主题 | `topic_name`, `confirm: bool = False`, `connection` | 强制 `confirm=True` 二次确认；只读或生产连接下拦截 |
 | `kafka_produce_message` | 向指定主题发送消息（支持字典/列表 JSON、文本与 Headers） | `topic`, `value`, `key`, `partition`, `headers`, `connection` | 只读模式或生产连接下自动拦截 |
-| `kafka_sample_messages` | 零提交位移瞬态采样读取消息，自适应格式解码 | `topic`, `partition`, `strategy`, `offset`, `limit`, `connection` | 只读安全 (上限 100 条) |
+| `kafka_sample_messages` | 零提交位移瞬态采样读取消息，自适应格式解码并支持大报文截断熔断 | `topic`, `partition`, `strategy`, `offset`, `limit`, `max_bytes_per_message`, `connection` | 只读安全 (默认 64KB 截断熔断，单次上限 100 条) |
 | `kafka_list_consumer_groups` | 枚举集群中所有消费组 ID、协议类型与运行状态 | `connection` | 只读安全 |
-| `kafka_describe_consumer_group` | 查询消费组各分区 Committed Offset、LEO、Lag 及活跃成员分配 | `group_id`, `connection` | 只读安全 (含已删除主题防御) |
-| `kafka_reset_consumer_group_offsets` | 重置指定消费组位移（支持 earliest, latest, to_offset, to_datetime） | `group_id`, `topic`, `strategy`, `offset`, `datetime_val`, `dry_run`, `confirm`, `force` | 默认 `dry_run=True` 预检；真正执行需 `confirm=True`；活跃组自动冲突拦截 |
+| `kafka_describe_consumer_group` | 查询消费组各分区 Committed Offset、LEO、Lag 及活跃成员分配 | `group_id`, `connection` | 只读安全 (单次批量 RPC 拓扑，含已删除主题防御) |
+| `kafka_reset_consumer_group_offsets` | 重置指定消费组位移（支持 earliest, latest, to_offset, to_datetime） | `group_id`, `topic`, `strategy`, `offset`, `datetime_val`, `partitions`, `dry_run`, `confirm`, `force`, `connection` | 默认 `dry_run=True` 预检；只读模式下开放预检并拦截物理提交；活跃组冲突拦截 |
 
 ### 2. Resources 资源集 (2 项)
 
@@ -98,26 +98,29 @@
                                 ┌──────────┴──────────┐
                      [dry_run=True (默认)]      [dry_run=False (执行)]
                                 │                         │
-                        只读试运行模拟             是否显式 confirm=True?
-                        计算 Lag / 变更前后              ├── 否 ──> 抛出 ValueError 拦截
-                                │                         └── 是
-                        安全返回预检报告 (无写入)                  │
-                                                   消费组是否处于 Stable 且存在活跃成员?
-                                                          ├── 是 ──> 是否 force=True?
-                                                          │            ├── 否 ──> 拦截拒绝 (防止状态冲突)
-                                                          │            └── 是 ──> 物理提交位移
-                                                          └── 否 ──> 物理提交位移并返回结果
+                        只读试运行模拟             是否为只读集群/只读连接?
+                        计算 Lag / 变更前后              ├── 是 ──> 强制拦截拒绝物理提交
+                                │                         └── 否
+                        安全返回预检报告 (无写入)            是否显式 confirm=True?
+                                                          ├── 否 ──> 抛出拦截警示
+                                                          └── 是
+                                                                   │
+                                                    消费组是否处于 Stable 且存在活跃成员?
+                                                           ├── 是 ──> 是否 force=True?
+                                                           │            ├── 否 ──> 拦截拒绝 (防止状态冲突)
+                                                           │            └── 是 ──> 物理提交位移
+                                                           └── 否 ──> 物理提交位移并返回结果
 ```
 
 #### A. 四大重置策略
 - **`earliest`**：回滚至最早可用位移（用于数据全量重新消费）；
 - **`latest`**：跳跃至最新分区末端位移（用于故障积压直接跳过、快速追齐实时数据）；
-- **`to_offset`**：指定具体的绝对位移数值（需配合 `offset` 参数）；
+- **`to_offset`**：指定具体的绝对位移数值（需配合 `offset` 参数；受**位移上界约束 (Offset Upper Bound Guard)** 保护，严禁设置超越分区 LEO 的未来位移以防消息永久丢失）；
 - **`to_datetime`**：回溯至指定历史时间点（配合 `datetime_val`，支持 ISO-8601 字符串如 `"2026-10-04T12:00:00+08:00"` 或毫秒时间戳如 `1791100000000`）。
 
 #### B. 标准运维实操工作流
 1. **阶段 1：预检评估 (Dry-Run)**  
-   默认 `dry_run=True`，服务端仅查询当前 Committed Offset、目标 New Offset 与预计 Lag 变动，**绝对不向 Kafka 提交任何位移**：
+   默认 `dry_run=True`，服务端仅查询当前 Committed Offset、目标 New Offset 与预计 Lag 变动，**绝对不向 Kafka 提交任何位移**（在全局 `--read-only` 模式下亦完全开放此安全预检能力）：
    > *“帮我预检一下将 order-group 消费组在 order-events 主题上的位移重置到 2026-10-04 12:00:00 的效果。”*
 2. **阶段 2：人工审查确认后物理提交**  
    审查预检报告确认无误后，显式传入 `dry_run=False, confirm=True` 完成物理提交：
@@ -135,18 +138,19 @@
 | :--- | :--- | :--- | :--- |
 | `-c, --config` | `MCP_KAFKA_CONFIG` | 无 | 多集群命名连接 YAML 配置文件路径（指定后启用多集群模式） |
 | `--bootstrap-servers` | `MCP_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | 单集群模式 Broker 引导地址（未指定配置文件时生效，多个逗号分隔） |
-| `--read-only` | `MCP_KAFKA_READ_ONLY` | `false` | 全局只读防线开关，开启后拒绝并隐藏一切写操作 |
+| `--read-only` | `MCP_KAFKA_READ_ONLY` | `false` | 全局只读防线开关，开启后拒绝一切写操作；位移重置锁定仅允许 `dry_run=True` 预检 |
 | `--security-protocol` | `MCP_KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | 底层通信安全协议 (`PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`) |
-| `--sasl-mechanism` | `MCP_KAFKA_SASL_MECHANISM` | `PLAIN` | SASL 认证机制 (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` 等) |
+| `--sasl-mechanism` | `MCP_KAFKA_SASL_MECHANISM` | 无 | SASL 认证机制 (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` 等) |
 | `--sasl-username` | `MCP_KAFKA_SASL_USERNAME` | 无 | SASL 身份认证用户名 / AccessKey |
-| `--sasl-password` | `MCP_KAFKA_SASL_PASSWORD` | 无 | SASL 身份认证密码 / SecretKey |
-| `--ssl-cafile` | `MCP_KAFKA_SSL_CAFILE` | 无 | SSL 根证书 CA 路径 (`.pem` / `.crt`)，用于校验 Broker 服务端证书 |
-| `--ssl-certfile` | `MCP_KAFKA_SSL_CERTFILE` | 无 | mTLS 双向认证客户端证书路径 |
-| `--ssl-keyfile` | `MCP_KAFKA_SSL_KEYFILE` | 无 | mTLS 双向认证客户端私钥路径 |
+| `--sasl-password` | `MCP_KAFKA_SASL_PASSWORD` | 无 | SASL 身份认证密码 / SecretKey (支持 `${VAR:-default}` 动态插值) |
+| `--ssl-cafile` | `MCP_KAFKA_SSL_CAFILE` | 无 | SSL 根证书 CA 路径 (`.pem` / `.crt`)，严格 Fail-Fast 校验存在性 |
+| `--ssl-certfile` | `MCP_KAFKA_SSL_CERTFILE` | 无 | mTLS 双向认证客户端证书路径 (须与私钥成对提供) |
+| `--ssl-keyfile` | `MCP_KAFKA_SSL_KEYFILE` | 无 | mTLS 双向认证客户端私钥路径 (须与证书成对提供) |
 | `--transport` | `MCP_KAFKA_TRANSPORT` | `stdio` | 传输协议网关类型：`stdio`（管道）或 `sse`（HTTP） |
 | `--host` | `MCP_KAFKA_SERVER_HOST` | `0.0.0.0` | HTTP SSE 模式监听主机地址 |
 | `--port` | `MCP_KAFKA_SERVER_PORT` | `8000` | HTTP SSE 模式监听端口号 |
 | `--log-level` | `MCP_KAFKA_LOG_LEVEL` | `INFO` | 服务日志级别 (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
 
 ### 🔐 企业级安全认证协议指南 (SASL / SSL / mTLS)
 

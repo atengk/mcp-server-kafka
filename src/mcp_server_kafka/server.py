@@ -133,7 +133,7 @@ def create_mcp_server(
     # 5. 注册消息采样 Tool (零提交位移只读探查)
     @server.tool(
         name="kafka_sample_messages",
-        description="从指定 Kafka 主题以零提交位移方式只读采样消息（支持 latest/earliest/offset 策略与自适应解码）",
+        description="从指定 Kafka 主题以零提交位移方式只读采样消息（支持 latest/earliest/offset 策略、自适应解码与大报文截断保护）",
     )
     async def kafka_sample_messages(
         topic: str,
@@ -141,6 +141,7 @@ def create_mcp_server(
         strategy: str = "latest",
         offset: int | None = None,
         limit: int = 10,
+        max_bytes_per_message: int = 65536,
         connection: str | None = None,
     ) -> dict[str, Any]:
         """以零位移影响方式采样拉取主题消息.
@@ -150,6 +151,7 @@ def create_mcp_server(
         @param strategy 采样策略 (latest / earliest / offset)，默认 latest
         @param offset 当 strategy=offset 时的起始数值
         @param limit 采样条数限制，默认 10，上限 100
+        @param max_bytes_per_message 单条消息最大载荷字节数，超出时实施截断，默认 65536 (64KB)
         @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含 messages 列表与 total 总数的结果字典；失败时返回错误描述字典
         """
@@ -161,6 +163,7 @@ def create_mcp_server(
                 strategy=strategy,
                 offset=offset,
                 limit=limit,
+                max_bytes_per_message=max_bytes_per_message,
             )
             return {
                 "connection": connection or reg.default_connection_name,
@@ -171,6 +174,7 @@ def create_mcp_server(
         except Exception as exc:  # noqa: BLE001
             logger.warning("采样 Kafka 消息失败 [topic=%s, connection=%s]: %s", topic, connection, exc)
             return {"error": f"采样消息失败: {exc}"}
+
 
     # 6. 注册消费组列表查询 Tool
     @server.tool(
@@ -323,68 +327,79 @@ def create_mcp_server(
                 logger.warning("生产 Kafka 消息失败 [topic=%s, connection=%s]: %s", topic, connection, exc)
                 return {"error": f"发送消息失败: {exc}"}
 
-        @server.tool(
-            name="kafka_reset_consumer_group_offsets",
-            description="重置指定消费组在目标主题上的消费位移（高危运维操作，支持 Dry-Run 预检与 earliest/latest/to_offset/to_datetime 策略）",
-        )
-        async def kafka_reset_consumer_group_offsets(
-            group_id: str,
-            topic: str,
-            strategy: str = "earliest",
-            offset: int | None = None,
-            datetime_val: str | float | None = None,
-            partitions: list[int] | None = None,
-            dry_run: bool = True,
-            confirm: bool = False,
-            force: bool = False,
-            connection: str | None = None,
-        ) -> dict[str, Any]:
-            """重置 Kafka 消费组消费位移.
+    # 8. 注册位移重置治理 Tool (支持 Dry-Run 预检试运行，在只读模式下亦开放预检评估)
+    reset_tool_desc = (
+        ("【只读模式：仅支持 dry_run=True 预检评估，物理提交将被严格拦截】" if reg.global_config.read_only else "")
+        + "重置指定消费组在目标主题上的消费位移（高危运维操作，支持 Dry-Run 预检与 earliest/latest/to_offset/to_datetime 策略）"
+    )
 
-            @param group_id 目标消费组 ID
-            @param topic 目标主题名称
-            @param strategy 重置策略 (earliest, latest, to_offset, to_datetime)，默认 earliest
-            @param offset 当 strategy=to_offset 时的目标数值
-            @param datetime_val 当 strategy=to_datetime 时的 ISO 时间串或毫秒时间戳
-            @param partitions 可选指定重置的分区列表，默认针对全部分区
-            @param dry_run 预检模式开关，默认为 True (仅评估回显影响范围，不真正落盘)
-            @param confirm 高危操作显式确认标志，真正落盘 (dry_run=False) 时强制要求为 True
-            @param force 强制跳过活跃消费组冲突防御，默认 False
-            @param connection 可选集群连接别名，未传或为空时使用默认连接
-            @return 包含每个分区调整前后位移、差值及状态的结果字典
-            """
-            target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
-            if reg.is_connection_read_only(target_name):
-                return {"error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行重置消费位移操作"}
+    @server.tool(
+        name="kafka_reset_consumer_group_offsets",
+        description=reset_tool_desc,
+    )
+    async def kafka_reset_consumer_group_offsets(
+        group_id: str,
+        topic: str,
+        strategy: str = "earliest",
+        offset: int | None = None,
+        datetime_val: str | float | None = None,
+        partitions: list[int] | None = None,
+        dry_run: bool = True,
+        confirm: bool = False,
+        force: bool = False,
+        connection: str | None = None,
+    ) -> dict[str, Any]:
+        """重置 Kafka 消费组消费位移.
 
-            # 三级防线：真正执行落盘时强制要求 confirm=True
-            if not dry_run and not confirm:
-                return {
-                    "error": "真正执行消费组位移重置属于高危变更操作，必须同时显式传入 dry_run=False 和 confirm=True 授权确认",
-                }
+        @param group_id 目标消费组 ID
+        @param topic 目标主题名称
+        @param strategy 重置策略 (earliest, latest, to_offset, to_datetime)，默认 earliest
+        @param offset 当 strategy=to_offset 时的目标数值
+        @param datetime_val 当 strategy=to_datetime 时的 ISO 时间串或毫秒时间戳
+        @param partitions 可选指定重置的分区列表，默认针对全部分区
+        @param dry_run 预检模式开关，默认为 True (仅评估回显影响范围，不真正落盘)
+        @param confirm 高危操作显式确认标志，真正落盘 (dry_run=False) 时强制要求为 True
+        @param force 强制跳过活跃消费组冲突防御，默认 False
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
+        @return 包含每个分区调整前后位移、差值及状态的结果字典
+        """
+        target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
+        is_conn_read_only = reg.is_connection_read_only(target_name)
 
-            try:
-                mgr = reg.get_manager(connection)
-                res = await mgr.reset_consumer_group_offsets(
-                    group_id=group_id,
-                    topic=topic,
-                    strategy=strategy,
-                    offset=offset,
-                    datetime_val=datetime_val,
-                    partitions=partitions,
-                    dry_run=dry_run,
-                    force=force,
-                )
-                return res.model_dump()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "重置 Kafka 消费组位移失败 [group=%s, topic=%s, connection=%s]: %s",
-                    group_id,
-                    topic,
-                    connection,
-                    exc,
-                )
-                return {"error": f"重置位移失败: {exc}"}
+        # 只读防线：只读模式下允许 dry_run=True 评估，严格禁止物理提交落盘
+        if is_conn_read_only and not dry_run:
+            return {
+                "error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行物理位移重置提交 (dry_run=False)。若需评估变动影响，请保持 dry_run=True 执行只读预检。"
+            }
+
+        # 三级防线：真正执行落盘时强制要求 confirm=True
+        if not dry_run and not confirm:
+            return {
+                "error": "真正执行消费组位移重置属于高危变更操作，必须同时显式传入 dry_run=False 和 confirm=True 授权确认",
+            }
+
+        try:
+            mgr = reg.get_manager(connection)
+            res = await mgr.reset_consumer_group_offsets(
+                group_id=group_id,
+                topic=topic,
+                strategy=strategy,
+                offset=offset,
+                datetime_val=datetime_val,
+                partitions=partitions,
+                dry_run=dry_run,
+                force=force,
+            )
+            return res.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "重置 Kafka 消费组位移失败 [group=%s, topic=%s, connection=%s]: %s",
+                group_id,
+                topic,
+                connection,
+                exc,
+            )
+            return {"error": f"重置位移失败: {exc}"}
 
 
     # 8. 注册集群摘要 Resource

@@ -11,25 +11,28 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 
 
 def interpolate_env_vars(val: Any) -> Any:
-    """递归对字符串、字典或列表中的 ${ENV_VAR} 执行环境变量插值.
+    """递归对字符串、字典或列表中的 ${ENV_VAR} 或 ${ENV_VAR:-default} 执行环境变量插值.
 
     @param val 待处理的数据（可为 str, dict, list 或其他基本类型）
     @return 替换环境变量后的数据
-    @throws ValueError 若指定的环境变量在当前系统中不存在则抛出异常 (Fail-Fast)
+    @throws ValueError 若指定的环境变量在当前系统中不存在且未设置默认值则抛出异常 (Fail-Fast)
     """
     if isinstance(val, str):
         def _replace_match(match: re.Match[str]) -> str:
             var_name = match.group(1)
+            default_val = match.group(2)
             env_val = os.getenv(var_name)
-            if env_val is None:
-                raise ValueError(f"配置文件中引用的环境变量 '${{{var_name}}}' 在当前系统中未定义")
-            return env_val
+            if env_val is not None:
+                return env_val
+            if default_val is not None:
+                return default_val
+            raise ValueError(f"配置文件中引用的环境变量 '${{{var_name}}}' 在当前系统中未定义")
 
         return _ENV_VAR_PATTERN.sub(_replace_match, val)
     if isinstance(val, dict):
@@ -87,6 +90,27 @@ class KafkaConnectionConfig(BaseModel):
         default=True,
         description="是否对 SSL 证书进行主机名/域名强校验",
     )
+
+    @model_validator(mode="after")
+    def validate_certificates_and_credentials(self) -> "KafkaConnectionConfig":
+        """严格 Fail-Fast 校验 SSL 证书与密钥文件存在性及成对约束."""
+        if self.ssl_cafile is not None:
+            ca_path = Path(self.ssl_cafile)
+            if not ca_path.is_file():
+                raise FileNotFoundError(f"指定的 SSL CA 根证书文件不存在或不可读: '{self.ssl_cafile}'")
+        if self.ssl_certfile is not None:
+            cert_path = Path(self.ssl_certfile)
+            if not cert_path.is_file():
+                raise FileNotFoundError(f"指定的 SSL 客户端证书文件不存在或不可读: '{self.ssl_certfile}'")
+            if self.ssl_keyfile is None:
+                raise ValueError("配置了 ssl_certfile 客户端证书时必须成对配置 ssl_keyfile 客户端私钥")
+        if self.ssl_keyfile is not None:
+            key_path = Path(self.ssl_keyfile)
+            if not key_path.is_file():
+                raise FileNotFoundError(f"指定的 SSL 客户端私钥文件不存在或不可读: '{self.ssl_keyfile}'")
+            if self.ssl_certfile is None:
+                raise ValueError("配置了 ssl_keyfile 客户端私钥时必须成对配置 ssl_certfile 客户端证书")
+        return self
 
 
 class KafkaConfig(BaseModel):

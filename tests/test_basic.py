@@ -9,4 +9,4 @@ from mcp_server_kafka import __version__
 
 def test_version() -> None:
     """验证模块版本声明."""
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.3.0"

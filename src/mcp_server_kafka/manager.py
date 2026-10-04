@@ -186,37 +186,56 @@ def _safe_decode_bytes(raw_bytes: bytes) -> str:
         return base64.b64encode(raw_bytes).decode("ascii")
 
 
-def decode_payload(raw_bytes: bytes | None) -> tuple[Any, str, int]:
-    """自适应反序列化原始消息载荷字节流.
+def decode_payload(
+    raw_bytes: bytes | None,
+    max_bytes: int = 65536,
+) -> tuple[Any, str, int, bool, int | None]:
+    """自适应反序列化原始消息载荷字节流，并提供消息截断熔断保护.
 
     优先尝试解析 UTF-8 JSON 结构化数据；若非合法 JSON 则保留为纯文本；
     若包含无法解码的二进制字节流，则安全降级为 Base64 字符串.
+    当载荷超过 max_bytes 阈值时实施截断，降级为前缀纯文本并附带截断元数据.
 
     @param raw_bytes 消息原始载荷字节流
-    @return (解码后对象或文本, 识别的编码类型, 原始字节大小)
+    @param max_bytes 单条消息最大解码字节上限 (默认 64KB)
+    @return (解码后对象或文本, 识别的编码类型, 当前字节大小, 是否截断, 原始完整字节大小)
     """
     if raw_bytes is None:
-        return None, "null", 0
+        return None, "null", 0, False, None
 
-    size = len(raw_bytes)
+    original_size = len(raw_bytes)
+    truncated = False
+    original_size_bytes = None
+
+    if max_bytes > 0 and original_size > max_bytes:
+        truncated = True
+        original_size_bytes = original_size
+        slice_bytes = raw_bytes[:max_bytes]
+        try:
+            text = slice_bytes.decode("utf-8", errors="replace")
+            return text, "text", len(slice_bytes), truncated, original_size_bytes
+        except Exception:  # noqa: BLE001
+            b64_str = base64.b64encode(slice_bytes).decode("ascii")
+            return b64_str, "base64", len(slice_bytes), truncated, original_size_bytes
+
     try:
         text = raw_bytes.decode("utf-8")
         try:
             parsed_json = json.loads(text)
-            return parsed_json, "json", size
+            return parsed_json, "json", original_size, False, None
         except (json.JSONDecodeError, ValueError):
-            return text, "text", size
+            return text, "text", original_size, False, None
     except UnicodeDecodeError:
         b64_str = base64.b64encode(raw_bytes).decode("ascii")
-        return b64_str, "base64", size
-
+        return b64_str, "base64", original_size, False, None
 
 
 def build_ssl_context(config: KafkaConnectionConfig | KafkaConfig) -> ssl.SSLContext | None:
-    """自适应构建 SSL/TLS 握手上下文.
+    """自适应构建 SSL/TLS 握手上下文，严格执行 Fail-Fast 凭据存在性校验.
 
     @param config 包含 SSL 证书与协议配置的对象
     @return 已配置的 SSLContext 实例，非 SSL 协议时返回 None
+    @throws FileNotFoundError 当显式指定的证书或私钥文件在磁盘不存在时抛出
     """
     security_protocol = getattr(config, "security_protocol", "PLAINTEXT")
     if security_protocol not in ("SSL", "SASL_SSL"):
@@ -227,12 +246,18 @@ def build_ssl_context(config: KafkaConnectionConfig | KafkaConfig) -> ssl.SSLCon
     keyfile = getattr(config, "ssl_keyfile", None)
     check_hostname = getattr(config, "ssl_check_hostname", True)
 
-    if cafile and Path(cafile).is_file():
+    if cafile:
+        if not Path(cafile).is_file():
+            raise FileNotFoundError(f"指定的 SSL CA 根证书文件不存在或不可读: '{cafile}'")
         context = ssl.create_default_context(cafile=cafile)
     else:
         context = ssl.create_default_context()
 
-    if certfile and keyfile and Path(certfile).is_file() and Path(keyfile).is_file():
+    if certfile or keyfile:
+        if not certfile or not Path(certfile).is_file():
+            raise FileNotFoundError(f"指定的 SSL 客户端证书文件不存在或不可读: '{certfile}'")
+        if not keyfile or not Path(keyfile).is_file():
+            raise FileNotFoundError(f"指定的 SSL 客户端私钥文件不存在或不可读: '{keyfile}'")
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
 
     context.check_hostname = check_hostname
@@ -240,6 +265,7 @@ def build_ssl_context(config: KafkaConnectionConfig | KafkaConfig) -> ssl.SSLCon
         context.verify_mode = ssl.CERT_NONE
 
     return context
+
 
 
 def _parse_datetime_to_ms(datetime_val: str | float) -> int:
@@ -512,7 +538,13 @@ class KafkaManager:
 
         # 2. 格式化标头列表
         headers_list = (
-            [(k, v.encode("utf-8") if isinstance(v, str) else v) for k, v in headers.items()]
+            [
+                (
+                    k,
+                    v if isinstance(v, bytes) else str(v).encode("utf-8")
+                )
+                for k, v in headers.items()
+            ]
             if headers
             else None
         )
@@ -543,6 +575,7 @@ class KafkaManager:
         key: bytes | str | None,
         raw_value: bytes | None,
         headers: dict[str, str] | list[tuple[str, bytes]] | None = None,
+        max_bytes_per_message: int = 65536,
     ) -> SampledMessage:
         """构建自适应反序列化后的采样消息实体.
 
@@ -552,6 +585,7 @@ class KafkaManager:
         @param key 消息键
         @param raw_value 原始消息载荷字节
         @param headers 消息标头
+        @param max_bytes_per_message 单条消息最大解析字节数
         @return 结构化采样消息实体
         """
         # 1. 解码消息键
@@ -559,8 +593,10 @@ class KafkaManager:
         if key is not None:
             key_str = key if isinstance(key, str) else _safe_decode_bytes(key)
 
-        # 2. 自适应解码载荷
-        decoded_val, encoding, size = decode_payload(raw_value)
+        # 2. 自适应解码载荷与截断熔断
+        decoded_val, encoding, size, truncated, original_size_bytes = decode_payload(
+            raw_value, max_bytes=max_bytes_per_message
+        )
 
         # 3. 整理标头键值对
         headers_dict: dict[str, str] = {}
@@ -582,7 +618,10 @@ class KafkaManager:
             headers=headers_dict,
             size=size,
             encoding=encoding,
+            truncated=truncated,
+            original_size_bytes=original_size_bytes,
         )
+
 
     def create_consumer(
         self,
@@ -609,6 +648,7 @@ class KafkaManager:
         strategy: str = "latest",
         offset: int | None = None,
         limit: int = 10,
+        max_bytes_per_message: int = 65536,
     ) -> list[SampledMessage]:
         """以零提交位移瞬态方式采样拉取主题消息.
 
@@ -617,6 +657,7 @@ class KafkaManager:
         @param strategy 采样策略 (latest / earliest / offset)
         @param offset 策略为 offset 时的起始数值
         @param limit 采样条数限制 (上限 100)
+        @param max_bytes_per_message 单条消息最大解析字节数，超额将实施截断
         @return 采样消息列表
         """
         effective_limit = min(max(limit, 1), 100)
@@ -667,8 +708,10 @@ class KafkaManager:
                             key=record.key,
                             raw_value=record.value,
                             headers=record.headers,
+                            max_bytes_per_message=max_bytes_per_message,
                         )
                     )
+
                     if len(sampled) >= effective_limit:
                         break
                 if len(sampled) >= effective_limit:
@@ -820,15 +863,17 @@ class KafkaManager:
         existing_topics = await self.list_topics(include_internal=True)
         existing_topic_names = {t.name for t in existing_topics}
 
-        # 补充涉足主题的所有物理分区（覆盖尚未分配或尚未提交位移的新分区）
+        # 补充涉足主题的所有物理分区（单次批量 RPC 消除 N+1 网络往返）
         involved_topics = {tp.topic for tp in all_tps if tp.topic in existing_topic_names}
-        for top_name in involved_topics:
+        if involved_topics:
             try:
-                t_detail = await self.describe_topic(top_name)
-                for part in t_detail.partitions:
-                    all_tps.add(TopicPartition(top_name, part.partition_id))
+                raw_topics = await admin.describe_topics(list(involved_topics))
+                for raw_top in raw_topics:
+                    t_detail = _parse_topic_detail(raw_top)
+                    for part in t_detail.partitions:
+                        all_tps.add(TopicPartition(t_detail.name, part.partition_id))
             except Exception as exc:  # noqa: BLE001
-                logger.debug("获取主题 [%s] 物理分区扩展信息失败: %s", top_name, exc)
+                logger.debug("批量获取涉足主题物理分区扩展信息失败: %s", exc)
 
         if not all_tps:
             return ConsumerGroupDetail(
@@ -999,8 +1044,22 @@ class KafkaManager:
             elif strategy_lower == "to_offset":
                 if offset is None:
                     raise ValueError("strategy='to_offset' 必须显式传入 offset 整数参数")
+                target_offset_val = max(0, offset)
+                # 位移上界约束 (Offset Upper Bound Guard)：校验目标位移不得超越分区当前 LEO
+                end_offsets = await consumer.end_offsets(target_tps)
+                over_leo_errors: list[str] = []
                 for tp in target_tps:
-                    target_offsets[tp.partition] = max(0, offset)
+                    leo = end_offsets.get(tp, 0)
+                    if target_offset_val > leo:
+                        over_leo_errors.append(f"分区 {tp.partition} (当前 LEO: {leo})")
+                if over_leo_errors:
+                    raise ValueError(
+                        f"目标重置位移 {target_offset_val} 超出分区日志末端位移 (LEO) 上界，已触发原子性拦截防御: "
+                        + ", ".join(over_leo_errors)
+                        + "。严禁设置未来位移以防消息永久丢失。"
+                    )
+                for tp in target_tps:
+                    target_offsets[tp.partition] = target_offset_val
 
             elif strategy_lower == "to_datetime":
                 if datetime_val is None:

@@ -1,5 +1,16 @@
 # 需求规格说明书：mcp-server-kafka 核心功能与架构
 
+> **交付与验收状态 (Status)**: ✅ 100% Completed & Verified (全部 6 项子工单已闭环并全量合并至 `main` 分支)
+>
+> | 工单编号 | 任务标题 | 交付提交 | 状态 |
+> | :--- | :--- | :--- | :---: |
+> | #2 | feat(cluster): 集群元数据只读接口与基础运行框架 | `68c8372` | **CLOSED** |
+> | #3 | feat(topic): 主题生命周期管理与安全防线机制 | `cc0ece4` | **CLOSED** |
+> | #4 | feat(producer): 消息安全生产通道与多类型载荷支持 | `19e55cb` | **CLOSED** |
+> | #5 | feat(consumer): 瞬态无侵入消息采样与自适应解码 | `f006c2e` | **CLOSED** |
+> | #6 | feat(group): 消费组状态监测与积压 (Lag) 根因诊断 | `9a13b5d` | **CLOSED** |
+> | #7 | feat(transport): Stdio 与 HTTP SSE 双模传输网关及生产容器集成 | `ea3922e` | **CLOSED** |
+
 ## 问题陈述 (Problem Statement)
 
 当大语言模型（LLM）与 AI Agent 需要与企业级 Apache Kafka 消息集群交互时，面临以下核心痛点：
@@ -86,5 +97,6 @@
 
 ## 补充说明 (Further Notes)
 
-- 本规格文档已由 `/grill-with-docs` 会话完整对齐，架构决策已沉淀于 `docs/adr/0001` 与 `docs/adr/0002`，领域术语表统一遵循根目录 `CONTEXT.md`；
-- 本工单挂载 `ready-for-agent` 标签，后续可直接交由自主代理开展实现与 TDD 落地。
+- 本规格文档已由 `/grill-with-docs` 会话完整对齐，架构决策已沉淀于 `docs/adr/0001`、`docs/adr/0002` 与 `docs/adr/0003`，领域术语表统一遵循根目录 `CONTEXT.md`；
+- 全部 6 个垂直切片子任务已按计划通过 TDD 闭环落地并全量通过 34 项最高测试接缝自动化测试，本规格说明书已完成全流程验收并正式归档。
+

@@ -36,8 +36,12 @@ jobs:
             revert
 
   build-and-test:
-    name: 构建与测试
+    name: 构建与测试 (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - name: 检出代码
@@ -49,7 +53,7 @@ jobs:
           enable-cache: true
 
       - name: 设置 Python 运行时
-        run: uv python install 3.11
+        run: uv python install ${{ matrix.python-version }}
 
       - name: 安装依赖
         run: uv sync --all-extras

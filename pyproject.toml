@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-server-kafka"
+version = "0.1.0"
+description = "Kafka Model Context Protocol (MCP) server in Python"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Ateng", email = "2385569970@qq.com" },
+]
+keywords = [
+    "mcp",
+    "kafka",
+    "model-context-protocol",
+    "llm",
+    "ai",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "aiokafka>=0.11.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+mcp-server-kafka = "mcp_server_kafka.server:main"
+
+[project.urls]
+Homepage = "https://github.com/atengk/mcp-server-kafka"
+Repository = "https://github.com/atengk/mcp-server-kafka"
+Issues = "https://github.com/atengk/mcp-server-kafka/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_server_kafka"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]

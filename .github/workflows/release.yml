@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    name: 自动发版与产物挂载
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 设置 Python 运行时
+        run: uv python install 3.11
+
+      - name: 编译打包 Wheel 与源码包并计算校验和 (SHA-256)
+        run: |
+          uv build
+          cd dist && sha256sum * > checksums.txt
+
+      - name: 生成发布日志 (基于 Commit 与 PR)
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: .cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG_RELEASE.md
+
+      - name: 创建 GitHub Release 并挂载发布内容
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.git-cliff.outputs.content }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------------------------
+  # 发布到 PyPI 插槽（推荐使用 PyPI Trusted Publishing OIDC 机制，按需启用）
+  # ----------------------------------------------------------------------------
+  # publish-pypi:
+  #   name: 发布至 PyPI
+  #   needs: github-release
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     id-token: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: astral-sh/setup-uv@v5
+  #     - run: uv build
+  #     - uses: pypa/gh-action-pypi-publish@release/v1

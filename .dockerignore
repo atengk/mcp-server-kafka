@@ -1,0 +1,43 @@
+# ==============================================================================
+# Docker 构建上下文忽略清单
+# 避免将本地缓存、构建中间产物及机密信息发送到 Docker 守护进程
+# ==============================================================================
+
+# 版本控制与 CI
+.git
+.github
+.gitignore
+.dockerignore
+
+# 文档与元数据
+*.md
+LICENSE
+
+# 操作系统与 IDE
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+# 敏感文件与本地环境变量
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+logs
+
+# Python / 构建缓存
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/

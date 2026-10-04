@@ -195,6 +195,43 @@ class KafkaConnectionSummary(BaseModel):
     bootstrap_servers: str = Field(description="Broker 引导连接地址列表")
     read_only: bool = Field(description="是否处于只读保护状态")
     is_default: bool = Field(default=False, description="是否为系统全局默认回退连接")
+    security_protocol: str = Field(default="PLAINTEXT", description="安全通信协议")
+    sasl_mechanism: str | None = Field(default=None, description="SASL 认证算法机制")
+
+
+class PartitionOffsetResetDetail(BaseModel):
+    """单分区位移重置计算明细实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    partition: int = Field(description="物理分区编号")
+    current_offset: int = Field(description="重置前已提交位移 (未提交时为 0)")
+    target_offset: int = Field(description="目标重置位移")
+    offset_delta: int = Field(description="位移变动差值 (target - current，负数表示回退，正数表示跳过)")
+
+
+class OffsetResetResult(BaseModel):
+    """消费组位移重置执行与预检结果实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    group_id: str = Field(description="目标消费组 ID")
+    topic: str = Field(description="目标主题")
+    strategy: str = Field(description="所采用的重置策略 (earliest, latest, to_offset, to_datetime)")
+    dry_run: bool = Field(description="是否仅为预检评估试运行")
+    applied: bool = Field(description="位移变更是否已真正落盘生效")
+    warning: str | None = Field(default=None, description="高危状态警示说明 (如消费组处于活跃状态)")
+    partitions: list[PartitionOffsetResetDetail] = Field(default_factory=list, description="各分区位移调整明细")
+    total_partitions: int = Field(default=0, description="受影响分区总数")
+    total_delta: int = Field(default=0, description="总净位移变动条数")
 
 
 

@@ -47,13 +47,15 @@
 14. 作为 AI Agent，我希望通过 MCP Resources 读取动态集群概况与主题元数据，以便在会话中直接挂载只读上下文。
 15. 作为 AI Agent，我希望调用预置的 Prompts 模板（如消费积压根因诊断），以便快速生成标准的运维排查指引与分析方案。
 16. 作为开发者与运维工程师，我希望能够通过 YAML 配置文件 (`--config connections.yaml`) 统一声明并纳管多套物理隔离的 Kafka 集群（如 default、staging、production），并在工具调用时按需路由或对生产连接实施细粒度只读保护，以便在单一会话中无缝跨环境协同运维。
+17. 作为企业级运维人员，我希望系统支持企业级安全认证协议矩阵（SASL_PLAINTEXT、SASL_SSL、SSL mTLS，覆盖 PLAIN 与 SCRAM-SHA-256/512 机制）并支持 `${ENV_VAR}` 环境变量动态插值，以便安全对接公有云托管（AWS MSK / 阿里云）与高隔离生产集群且杜绝明文密码泄露。
+18. 作为运维与应急响应工程师，我希望在大模型诊断出消费积压或死信阻塞后，能够调用位移重置工具以 Dry-Run 预检模式安全评估影响范围，并在显式授权后支持回退或跳跃消费位移，同时自动拦截活跃消费组状态冲突以防数据覆写。
 
 ## 实现决策 (Implementation Decisions)
 
 - **框架与构建后端**：基于 Python 3.10+、FastMCP 框架与 `uv` 构建，采用 `hatchling` 构建后端，严格遵循 PEP 621 标准。
-- **底层驱动架构**：消息生产、消息消费及基础通信基于 `aiokafka` 纯异步驱动，保障高并发无阻塞；管理类操作（Topic CRUD、消费组与 Lag 计算）封装为异步 Admin 接口协同调度。
+- **底层驱动架构**：消息生产、消息消费及基础通信基于 `aiokafka` 纯异步驱动，保障高并发无阻塞；管理类操作（Topic CRUD、消费组与 Lag 计算、位移重置）封装为异步 Admin 接口与受管 Consumer 协同调度。
 - **协议能力设计**：
-  - **Tools 列表 (10 项，全量支持可选 `connection` 动态路由参数)**：
+  - **Tools 列表 (11 项，全量支持可选 `connection` 动态路由参数)**：
     - `kafka_list_connections`：枚举当前服务端已配置的所有 Kafka 集群命名连接清单及只读状态；
     - `kafka_cluster_info`：获取集群概况与 Broker 节点列表；
     - `kafka_list_topics`：列出所有主题及其分区基本信息；
@@ -63,7 +65,8 @@
     - `kafka_produce_message`：向主题发送消息（支持 key、value、headers，只读模式或只读连接下拦截）；
     - `kafka_sample_messages`：零位移提交只读采样消息（支持 topic、partition、offset/strategy、limit）；
     - `kafka_list_consumer_groups`：列出集群所有消费组；
-    - `kafka_describe_consumer_group`：查询消费组详情及各分区的 Committed Offset 与 Lag。
+    - `kafka_describe_consumer_group`：查询消费组详情及各分区的 Committed Offset 与 Lag；
+    - `kafka_reset_consumer_group_offsets`：重置消费组消费位移（支持 earliest/latest/to_offset/to_datetime，默认 `dry_run=True` 预检，强制 `confirm=True` 二次确认，活跃消费组前置拦截防御）。
   - **Resources 列表**：
     - `kafka://cluster/summary`：集群整体元数据与 Broker 清单；
     - `kafka://topics/{topic}`：指定主题的实时状态与分区明细。

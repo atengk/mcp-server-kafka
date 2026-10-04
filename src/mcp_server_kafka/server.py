@@ -323,6 +323,69 @@ def create_mcp_server(
                 logger.warning("生产 Kafka 消息失败 [topic=%s, connection=%s]: %s", topic, connection, exc)
                 return {"error": f"发送消息失败: {exc}"}
 
+        @server.tool(
+            name="kafka_reset_consumer_group_offsets",
+            description="重置指定消费组在目标主题上的消费位移（高危运维操作，支持 Dry-Run 预检与 earliest/latest/to_offset/to_datetime 策略）",
+        )
+        async def kafka_reset_consumer_group_offsets(
+            group_id: str,
+            topic: str,
+            strategy: str = "earliest",
+            offset: int | None = None,
+            datetime_val: str | float | None = None,
+            partitions: list[int] | None = None,
+            dry_run: bool = True,
+            confirm: bool = False,
+            force: bool = False,
+            connection: str | None = None,
+        ) -> dict[str, Any]:
+            """重置 Kafka 消费组消费位移.
+
+            @param group_id 目标消费组 ID
+            @param topic 目标主题名称
+            @param strategy 重置策略 (earliest, latest, to_offset, to_datetime)，默认 earliest
+            @param offset 当 strategy=to_offset 时的目标数值
+            @param datetime_val 当 strategy=to_datetime 时的 ISO 时间串或毫秒时间戳
+            @param partitions 可选指定重置的分区列表，默认针对全部分区
+            @param dry_run 预检模式开关，默认为 True (仅评估回显影响范围，不真正落盘)
+            @param confirm 高危操作显式确认标志，真正落盘 (dry_run=False) 时强制要求为 True
+            @param force 强制跳过活跃消费组冲突防御，默认 False
+            @param connection 可选集群连接别名，未传或为空时使用默认连接
+            @return 包含每个分区调整前后位移、差值及状态的结果字典
+            """
+            target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
+            if reg.is_connection_read_only(target_name):
+                return {"error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行重置消费位移操作"}
+
+            # 三级防线：真正执行落盘时强制要求 confirm=True
+            if not dry_run and not confirm:
+                return {
+                    "error": "真正执行消费组位移重置属于高危变更操作，必须同时显式传入 dry_run=False 和 confirm=True 授权确认",
+                }
+
+            try:
+                mgr = reg.get_manager(connection)
+                res = await mgr.reset_consumer_group_offsets(
+                    group_id=group_id,
+                    topic=topic,
+                    strategy=strategy,
+                    offset=offset,
+                    datetime_val=datetime_val,
+                    partitions=partitions,
+                    dry_run=dry_run,
+                    force=force,
+                )
+                return res.model_dump()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "重置 Kafka 消费组位移失败 [group=%s, topic=%s, connection=%s]: %s",
+                    group_id,
+                    topic,
+                    connection,
+                    exc,
+                )
+                return {"error": f"重置位移失败: {exc}"}
+
 
     # 8. 注册集群摘要 Resource
     @server.resource(

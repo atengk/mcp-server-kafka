@@ -40,9 +40,11 @@
 - 🎯 **现代 Python 技术栈**：基于 Python 3.10+、FastMCP 框架与 `uv` 极速包管理器构建，遵循 PEP 621 标准；
 - ⚡ **纯异步高性能驱动**：全面采用 `aiokafka` 异步通信与 Admin 接口，高并发无阻塞；
 - 🔀 **多集群命名连接路由**：支持通过 `--config connections.yaml` 统一声明多套环境实例（如 default、staging、production），实现单进程内无状态动态调度；
-- 🛡️ **双重安全防线**：
+- 🔐 **企业级安全认证协议矩阵**：全面支持 `PLAINTEXT`、`SSL` (mTLS 双向证书)、`SASL_PLAINTEXT` 与 `SASL_SSL`（覆盖 `PLAIN`、`SCRAM-SHA-256`、`SCRAM-SHA-512` 等），支持 `${ENV_VAR}` 环境变量动态插值防范明文泄露；
+- 🛡️ **三级纵深安全防线与 Dry-Run 预检**：
   - **一级防线（全局只读）**：开启 `--read-only` 模式时，一切变更类工具自动隐藏并阻断执行；
-  - **二级防线（高危确认 & 连接级隔离）**：删除主题等破坏性操作强制要求显式传入 `confirm=True` 二次确认；支持为生产连接单独配置 `read_only: true` 实施实例级只读写保护；
+  - **二级防线（连接级隔离）**：支持为生产连接单独配置 `read_only: true` 实施实例级只读写保护；
+  - **三级防线（预检试运行 & 二次确认）**：高危位移重置支持 `dry_run=True` 预检评估与 `confirm=True` 二次确认，自动拦截活跃消费组状态冲突；
 - 🔍 **零位移侵入瞬态采样**：采样读取消息时不加入消费组、强制不向 `__consumer_offsets` 提交位移，绝不破坏生产环境业务消费进度；
 - 🧩 **自适应内容解析**：消息载荷优先解析为结构化 JSON 或 UTF-8 文本，二进制载荷安全降级为 Base64；
 - 🌐 **Stdio / HTTP SSE 双模传输**：完美兼顾本地单机桌面客户端（如 Claude Desktop）与云原生容器常驻运行；
@@ -52,11 +54,11 @@
 
 ## 🛠️ MCP 协议能力清单 (Tools, Resources, Prompts)
 
-### 1. Tools 工具集 (10 项)
+### 1. Tools 工具集 (11 项)
 
 | 工具名称 | 功能描述 | 核心入参 | 安全策略 |
 | :--- | :--- | :--- | :--- |
-| `kafka_list_connections` | 枚举当前服务端已配置的所有 Kafka 集群命名连接清单及只读状态 | 无 | 只读安全 |
+| `kafka_list_connections` | 枚举当前服务端已配置的所有 Kafka 集群命名连接清单、安全协议及只读状态 | 无 | 只读安全 |
 | `kafka_cluster_info` | 查询 Kafka 集群元数据与 Broker 节点列表 | `connection`（可选集群别名） | 只读安全 |
 | `kafka_list_topics` | 列出集群主题清单及分区数 | `pattern`, `include_internal`, `connection` | 只读安全 |
 | `kafka_describe_topic` | 查询指定主题的分区分布、Leader 节点、ISR 与自定义配置 | `topic_name`, `connection` | 只读安全 |
@@ -66,6 +68,7 @@
 | `kafka_sample_messages` | 零提交位移瞬态采样读取消息，自适应格式解码 | `topic`, `partition`, `strategy`, `offset`, `limit`, `connection` | 只读安全 (上限 100 条) |
 | `kafka_list_consumer_groups` | 枚举集群中所有消费组 ID、协议类型与运行状态 | `connection` | 只读安全 |
 | `kafka_describe_consumer_group` | 查询消费组各分区 Committed Offset、LEO、Lag 及活跃成员分配 | `group_id`, `connection` | 只读安全 (含已删除主题防御) |
+| `kafka_reset_consumer_group_offsets` | 重置指定消费组位移（支持 earliest, latest, to_offset, to_datetime） | `group_id`, `topic`, `strategy`, `offset`, `datetime_val`, `dry_run`, `confirm`, `force` | 默认 `dry_run=True` 预检；真正执行需 `confirm=True`；活跃组自动冲突拦截 |
 
 ### 2. Resources 资源集 (2 项)
 

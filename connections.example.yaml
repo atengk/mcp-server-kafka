@@ -31,3 +31,24 @@ connections:
     name: "production"
     bootstrap_servers: "kafka-prod-1.internal:9092,kafka-prod-2.internal:9092,kafka-prod-3.internal:9092"
     read_only: true
+
+  # 公有云托管高可用集群示例 (AWS MSK / 阿里云，SASL_SSL + SCRAM-SHA-512，支持环境变量插值)
+  cloud_msk:
+    name: "cloud_msk"
+    bootstrap_servers: "b-1.msk-cluster.xyz.kafka.us-east-1.amazonaws.com:9096,b-2.msk-cluster.xyz.kafka.us-east-1.amazonaws.com:9096"
+    security_protocol: "SASL_SSL"
+    sasl_mechanism: "SCRAM-SHA-512"
+    sasl_username: "msk_operator"
+    sasl_password: "${KAFKA_MSK_PASSWORD}"  # 运行时从系统环境变量动态插值注入，防范明文凭证泄露
+    read_only: true
+
+  # 企业内网双向证书加密集群示例 (mTLS 双向认证)
+  internal_mtls:
+    name: "internal_mtls"
+    bootstrap_servers: "kafka-secure-1.corp.internal:9093,kafka-secure-2.corp.internal:9093"
+    security_protocol: "SSL"
+    ssl_cafile: "/etc/kafka/certs/ca-root.crt"
+    ssl_certfile: "/etc/kafka/certs/client-cert.pem"
+    ssl_keyfile: "/etc/kafka/certs/client-key.pem"
+    ssl_check_hostname: true
+    read_only: false

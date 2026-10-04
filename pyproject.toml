@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atengk-mcp-server-kafka"
-version = "1.1.0"
+version = "1.2.0"
 description = "Kafka Model Context Protocol (MCP) server in Python"
 readme = "README.md"
 license = "Apache-2.0"

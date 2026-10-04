@@ -8,11 +8,15 @@ import asyncio
 import base64
 import json
 import logging
+import ssl
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.coordinator.protocol import ConsumerProtocolMemberAssignment
+from aiokafka.structs import OffsetAndMetadata
 
 from mcp_server_kafka.config import KafkaConfig, KafkaConnectionConfig
 from mcp_server_kafka.models import (
@@ -22,8 +26,10 @@ from mcp_server_kafka.models import (
     ConsumerGroupMember,
     ConsumerGroupSummary,
     KafkaConnectionSummary,
+    OffsetResetResult,
     PartitionInfo,
     PartitionLag,
+    PartitionOffsetResetDetail,
     ProduceResult,
     SampledMessage,
     TopicDetail,
@@ -206,6 +212,63 @@ def decode_payload(raw_bytes: bytes | None) -> tuple[Any, str, int]:
 
 
 
+def build_ssl_context(config: KafkaConnectionConfig | KafkaConfig) -> ssl.SSLContext | None:
+    """自适应构建 SSL/TLS 握手上下文.
+
+    @param config 包含 SSL 证书与协议配置的对象
+    @return 已配置的 SSLContext 实例，非 SSL 协议时返回 None
+    """
+    security_protocol = getattr(config, "security_protocol", "PLAINTEXT")
+    if security_protocol not in ("SSL", "SASL_SSL"):
+        return None
+
+    cafile = getattr(config, "ssl_cafile", None)
+    certfile = getattr(config, "ssl_certfile", None)
+    keyfile = getattr(config, "ssl_keyfile", None)
+    check_hostname = getattr(config, "ssl_check_hostname", True)
+
+    if cafile and Path(cafile).is_file():
+        context = ssl.create_default_context(cafile=cafile)
+    else:
+        context = ssl.create_default_context()
+
+    if certfile and keyfile and Path(certfile).is_file() and Path(keyfile).is_file():
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+
+    context.check_hostname = check_hostname
+    if not check_hostname:
+        context.verify_mode = ssl.CERT_NONE
+
+    return context
+
+
+def _parse_datetime_to_ms(datetime_val: str | float) -> int:
+    """将多样化时间输入格式安全解析为毫秒级 UNIX 时间戳.
+
+    @param datetime_val ISO-8601 字符串、秒级或毫秒级数字
+    @return 毫秒级时间戳整数
+    @throws ValueError 无法解析时间格式时抛出
+    """
+    if isinstance(datetime_val, (int, float)):
+        ts = int(datetime_val)
+        return ts * 1000 if ts < 10_000_000_000 else ts
+
+    s = str(datetime_val).strip()
+    if s.isdigit():
+        ts = int(s)
+        return ts * 1000 if ts < 10_000_000_000 else ts
+
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return int(dt.timestamp() * 1000)
+    except Exception as exc:
+        raise ValueError(
+            f"无法将时间输入 '{s}' 解析为有效时间戳，支持格式如 '2026-10-04T12:00:00+08:00' 或毫秒时间戳: {exc}"
+        ) from exc
+
+
 class KafkaManager:
     """Kafka 异步客户端与生命周期管理器.
 
@@ -224,11 +287,33 @@ class KafkaManager:
         self._admin_client: AIOKafkaAdminClient | None = None
         self._producer: AIOKafkaProducer | None = None
         self._lock = asyncio.Lock()
+        self._ssl_context = build_ssl_context(config)
 
     @property
     def config(self) -> KafkaConnectionConfig | KafkaConfig:
         """获取当前运行时配置."""
         return self._config
+
+    def _get_security_kwargs(self) -> dict[str, Any]:
+        """提取底层 aiokafka 客户端公用的安全鉴权参数字典.
+
+        @return 传给 AIOKafka 构造函数的关键字参数字典
+        """
+        kwargs: dict[str, Any] = {
+            "security_protocol": getattr(self._config, "security_protocol", "PLAINTEXT"),
+        }
+        sasl_mechanism = getattr(self._config, "sasl_mechanism", None)
+        if sasl_mechanism:
+            kwargs["sasl_mechanism"] = sasl_mechanism
+        sasl_user = getattr(self._config, "sasl_username", None)
+        if sasl_user:
+            kwargs["sasl_plain_username"] = sasl_user
+        sasl_pass = getattr(self._config, "sasl_password", None)
+        if sasl_pass:
+            kwargs["sasl_plain_password"] = sasl_pass
+        if self._ssl_context is not None:
+            kwargs["ssl_context"] = self._ssl_context
+        return kwargs
 
     async def get_admin_client(self) -> AIOKafkaAdminClient:
         """获取或惰性初始化 AIOKafkaAdminClient 实例.
@@ -242,6 +327,7 @@ class KafkaManager:
             if self._admin_client is None:
                 client = AIOKafkaAdminClient(
                     bootstrap_servers=self._config.bootstrap_servers,
+                    **self._get_security_kwargs(),
                 )
                 await client.start()
                 self._admin_client = client
@@ -259,6 +345,7 @@ class KafkaManager:
             if self._producer is None:
                 prod = AIOKafkaProducer(
                     bootstrap_servers=self._config.bootstrap_servers,
+                    **self._get_security_kwargs(),
                 )
                 await prod.start()
                 self._producer = prod
@@ -497,15 +584,22 @@ class KafkaManager:
             encoding=encoding,
         )
 
-    def create_consumer(self) -> AIOKafkaConsumer:
-        """创建瞬态采样消费者实例 (强制关闭自动提交且无消费组).
+    def create_consumer(
+        self,
+        group_id: str | None = None,
+        enable_auto_commit: bool = False,
+    ) -> AIOKafkaConsumer:
+        """创建消费者实例 (默认关闭自动提交).
 
+        @param group_id 可选消费组 ID
+        @param enable_auto_commit 是否开启自动提交位移，默认 False
         @return 配置好的 AIOKafkaConsumer 实例
         """
         return AIOKafkaConsumer(
             bootstrap_servers=self._config.bootstrap_servers,
-            enable_auto_commit=False,
-            group_id=None,
+            enable_auto_commit=enable_auto_commit,
+            group_id=group_id,
+            **self._get_security_kwargs(),
         )
 
     async def sample_messages(
@@ -814,6 +908,166 @@ class KafkaManager:
             total_lag=total_lag,
         )
 
+    async def reset_consumer_group_offsets(
+        self,
+        group_id: str,
+        topic: str,
+        strategy: str,
+        offset: int | None = None,
+        datetime_val: str | float | None = None,
+        partitions: list[int] | None = None,
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> OffsetResetResult:
+        """重置指定消费组在目标主题上的消费位移 (支持 Dry-Run 预检与活跃冲突防御).
+
+        @param group_id 目标消费组 ID
+        @param topic 目标主题名
+        @param strategy 重置策略 (earliest, latest, to_offset, to_datetime)
+        @param offset 当 strategy=to_offset 时的目标位移数值
+        @param datetime_val 当 strategy=to_datetime 时的 ISO 时间串或毫秒时间戳
+        @param partitions 可选指定重置的分区列表，为 None 时针对该主题所有物理分区
+        @param dry_run 是否仅预检评估，默认 True
+        @param force 是否强制重置活跃状态下的消费组，默认 False
+        @return 包含每个分区调整前后位移与差值的计算结果实体
+        @throws ValueError 参数非法或活跃消费组冲突拦截时抛出
+        """
+        # 1. 前置状态探测：检查消费组活跃性
+        admin = await self.get_admin_client()
+        warning: str | None = None
+        try:
+            group_desc_list = await admin.describe_consumer_groups([group_id])
+            if group_desc_list:
+                grp_desc = group_desc_list[0]
+                state = getattr(grp_desc, "state", "Unknown")
+                members = getattr(grp_desc, "members", [])
+                if state in ("Stable", "PreparingRebalance", "CompletingRebalance") and len(members) > 0:
+                    warning = (
+                        f"消费组 '{group_id}' 当前处于活跃运行状态 ({state}, 活跃成员数: {len(members)})，"
+                        "直接重置位移可能被下游消费客户端的心跳与提交覆盖！"
+                    )
+                    if not dry_run and not force:
+                        raise ValueError(f"{warning} 建议先停机下游消费者，或在确认影响后传入 force=True 强制执行。")
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("获取消费组 %s 状态用于活跃检查失败 (可能为空组): %s", group_id, exc)
+
+        # 2. 获取目标主题的所有物理分区
+        consumer = self.create_consumer()
+        await consumer.start()
+        try:
+            all_parts = await consumer.partitions_for_topic(topic)
+            if not all_parts:
+                raise ValueError(f"主题 '{topic}' 不存在或当前没有任何可用物理分区")
+
+            target_part_ids = sorted(
+                list(all_parts) if partitions is None else [p for p in partitions if p in all_parts]
+            )
+            if not target_part_ids:
+                raise ValueError(f"指定的分区列表 {partitions} 与主题 '{topic}' 的现有物理分区 {sorted(all_parts)} 无交集")
+
+            target_tps = [TopicPartition(topic, p) for p in target_part_ids]
+
+            # 3. 获取各分区当前已提交位移
+            committed_map = await admin.list_consumer_group_offsets(group_id)
+            current_offsets: dict[int, int] = {}
+            for tp in target_tps:
+                comm = committed_map.get(tp)
+                if comm is not None:
+                    curr_off = getattr(comm, "offset", None)
+                    if curr_off is None and isinstance(comm, (tuple, list)) and len(comm) > 0:
+                        curr_off = comm[0]
+                    current_offsets[tp.partition] = curr_off if curr_off is not None else 0
+                else:
+                    current_offsets[tp.partition] = 0
+
+            # 4. 根据策略计算 target_offsets
+            target_offsets: dict[int, int] = {}
+            strategy_lower = strategy.strip().lower()
+
+            if strategy_lower == "earliest":
+                beg_offsets = await consumer.beginning_offsets(target_tps)
+                for tp in target_tps:
+                    target_offsets[tp.partition] = beg_offsets.get(tp, 0)
+
+            elif strategy_lower == "latest":
+                end_offsets = await consumer.end_offsets(target_tps)
+                for tp in target_tps:
+                    target_offsets[tp.partition] = end_offsets.get(tp, 0)
+
+            elif strategy_lower == "to_offset":
+                if offset is None:
+                    raise ValueError("strategy='to_offset' 必须显式传入 offset 整数参数")
+                for tp in target_tps:
+                    target_offsets[tp.partition] = max(0, offset)
+
+            elif strategy_lower == "to_datetime":
+                if datetime_val is None:
+                    raise ValueError("strategy='to_datetime' 必须显式传入 datetime_val 参数")
+                target_ts_ms = _parse_datetime_to_ms(datetime_val)
+                times_query = {tp: target_ts_ms for tp in target_tps}
+                found_offsets = await consumer.offsets_for_times(times_query)
+                end_offsets = await consumer.end_offsets(target_tps)
+                for tp in target_tps:
+                    found = found_offsets.get(tp)
+                    if found is not None and getattr(found, "offset", None) is not None:
+                        target_offsets[tp.partition] = found.offset
+                    else:
+                        target_offsets[tp.partition] = end_offsets.get(tp, 0)
+            else:
+                raise ValueError(
+                    f"不支持的位移重置策略: '{strategy}'，可选值: earliest, latest, to_offset, to_datetime"
+                )
+
+            # 5. 构建每个分区的明细列表与总变动差值
+            details: list[PartitionOffsetResetDetail] = []
+            total_delta = 0
+            for p in target_part_ids:
+                curr = current_offsets[p]
+                targ = target_offsets[p]
+                delta = targ - curr
+                total_delta += delta
+                details.append(
+                    PartitionOffsetResetDetail(
+                        partition=p,
+                        current_offset=curr,
+                        target_offset=targ,
+                        offset_delta=delta,
+                    )
+                )
+
+        finally:
+            await consumer.stop()
+
+        # 6. 若非 dry_run，真正落盘提交位移
+        applied = False
+        if not dry_run:
+            commit_consumer = self.create_consumer(group_id=group_id, enable_auto_commit=False)
+            await commit_consumer.start()
+            try:
+                commit_consumer.assign(target_tps)
+                commit_dict = {
+                    tp: OffsetAndMetadata(target_offsets[tp.partition], "mcp-server-kafka reset")
+                    for tp in target_tps
+                }
+                await commit_consumer.commit(commit_dict)
+                applied = True
+            finally:
+                await commit_consumer.stop()
+
+        return OffsetResetResult(
+            group_id=group_id,
+            topic=topic,
+            strategy=strategy_lower,
+            dry_run=dry_run,
+            applied=applied,
+            warning=warning,
+            partitions=details,
+            total_partitions=len(details),
+            total_delta=total_delta,
+        )
+
 
 class KafkaManagerRegistry:
     """多集群 Kafka 管理器注册中心 (Connection Registry).
@@ -897,6 +1151,8 @@ class KafkaManagerRegistry:
                     bootstrap_servers=conn_cfg.bootstrap_servers,
                     read_only=is_ro,
                     is_default=is_def,
+                    security_protocol=conn_cfg.security_protocol,
+                    sasl_mechanism=conn_cfg.sasl_mechanism,
                 )
             )
         return result

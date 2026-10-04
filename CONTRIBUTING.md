@@ -70,7 +70,7 @@
 发版前在 `pyproject.toml` 与 `src/mcp_server_kafka/__init__.py` 中同步递增 `version` 字段：
 ```bash
 # 递增后在本地提交
-git commit -am "chore(release): v1.1.0"
+git commit -am "chore(release): v1.2.0"
 ```
 
 ### 3. 打标签并推送到远端（触发发版）
@@ -81,8 +81,8 @@ git commit -am "chore(release): v1.1.0"
 git push origin main
 
 # 步骤 B：打版本标签并推送到 GitHub (如 v1.1.0, v1.2.0 等)
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 ### 4. 自动化流水线运行

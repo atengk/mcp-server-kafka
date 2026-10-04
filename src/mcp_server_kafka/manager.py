@@ -111,6 +111,62 @@ def _parse_topic_detail(raw_topic: Any) -> TopicDetail:
     )
 
 
+def _parse_group_item(raw_group: Any) -> tuple[int, str, str, str, str, list[Any]]:
+    """将底层多样化消费组描述规整为统一属性元组.
+
+    @param raw_group 底层消费组描述元组、字典或对象
+    @return (error_code, group_id, state, protocol_type, protocol, raw_members)
+    """
+    if isinstance(raw_group, (tuple, list)):
+        err = int(raw_group[0]) if len(raw_group) > 0 else 0
+        gid = str(raw_group[1]) if len(raw_group) > 1 else ""
+        st = str(raw_group[2]) if len(raw_group) > 2 else "Unknown"
+        proto_type = str(raw_group[3]) if len(raw_group) > 3 else ""
+        proto = str(raw_group[4]) if len(raw_group) > 4 else ""
+        members = list(raw_group[5]) if len(raw_group) > 5 else []
+        return err, gid, st, proto_type, proto, members
+    if isinstance(raw_group, dict):
+        err = int(raw_group.get("error_code", 0))
+        gid = str(raw_group.get("group") or raw_group.get("group_id") or "")
+        st = str(raw_group.get("state", "Unknown"))
+        proto_type = str(raw_group.get("protocol_type", ""))
+        proto = str(raw_group.get("protocol", ""))
+        members = list(raw_group.get("members", []))
+        return err, gid, st, proto_type, proto, members
+    err = int(getattr(raw_group, "error_code", 0))
+    gid = str(getattr(raw_group, "group", getattr(raw_group, "group_id", "")))
+    st = str(getattr(raw_group, "state", "Unknown"))
+    proto_type = str(getattr(raw_group, "protocol_type", ""))
+    proto = str(getattr(raw_group, "protocol", ""))
+    members = list(getattr(raw_group, "members", []))
+    return err, gid, st, proto_type, proto, members
+
+
+def _parse_member_item(raw_member: Any) -> tuple[str, str, str, Any]:
+    """将底层成员载荷规整为统一标识属性.
+
+    @param raw_member 底层成员元组、字典或对象
+    @return (member_id, client_id, client_host, member_assignment)
+    """
+    if isinstance(raw_member, (tuple, list)):
+        mid = str(raw_member[0]) if len(raw_member) > 0 else ""
+        cid = str(raw_member[1]) if len(raw_member) > 1 else ""
+        chost = str(raw_member[2]) if len(raw_member) > 2 else ""
+        massign = raw_member[4] if len(raw_member) > 4 else b""
+        return mid, cid, chost, massign
+    if isinstance(raw_member, dict):
+        mid = str(raw_member.get("member_id", ""))
+        cid = str(raw_member.get("client_id", ""))
+        chost = str(raw_member.get("client_host", ""))
+        massign = raw_member.get("member_assignment", b"")
+        return mid, cid, chost, massign
+    mid = str(getattr(raw_member, "member_id", ""))
+    cid = str(getattr(raw_member, "client_id", ""))
+    chost = str(getattr(raw_member, "client_host", ""))
+    massign = getattr(raw_member, "member_assignment", b"")
+    return mid, cid, chost, massign
+
+
 def _safe_decode_bytes(raw_bytes: bytes) -> str:
     """安全解码字节流为 UTF-8 文本，失败时自动降级为 Base64 编码字符串.
 
@@ -568,15 +624,9 @@ class KafkaManager:
                     else (resp.get("groups", []) if isinstance(resp, dict) else [])
                 )
                 for g in groups_list:
-                    if isinstance(g, (tuple, list)) and len(g) >= 3:
-                        err, g_name, st = g[0], g[1], g[2]
-                        if err == 0:
-                            state_map[str(g_name)] = str(st)
-                    elif isinstance(g, dict):
-                        if g.get("error_code", 0) == 0 and "group" in g:
-                            state_map[str(g["group"])] = str(g.get("state", "Unknown"))
-                    elif hasattr(g, "group") and getattr(g, "error_code", 0) == 0:
-                        state_map[str(g.group)] = str(getattr(g, "state", "Unknown"))
+                    err, g_name, st, _, _, _ = _parse_group_item(g)
+                    if err == 0 and g_name:
+                        state_map[g_name] = st
         except Exception as exc:  # noqa: BLE001
             logger.warning("批量查询消费组状态异常，回退默认状态: %s", exc)
 
@@ -606,11 +656,7 @@ class KafkaManager:
                 else (resp.get("groups", []) if isinstance(resp, dict) else [])
             )
             for g in groups_list:
-                g_id = (
-                    g[1]
-                    if isinstance(g, (tuple, list)) and len(g) > 1
-                    else (g.get("group") if isinstance(g, dict) else getattr(g, "group", None))
-                )
+                _, g_id, _, _, _, _ = _parse_group_item(g)
                 if g_id == group_id:
                     target_group = g
                     break
@@ -620,25 +666,7 @@ class KafkaManager:
         if target_group is None:
             raise ValueError(f"消费组 '{group_id}' 不存在或查询失败")
 
-        if isinstance(target_group, (tuple, list)):
-            err_code = target_group[0] if len(target_group) > 0 else 0
-            state = str(target_group[2]) if len(target_group) > 2 else "Unknown"
-            protocol_type = str(target_group[3]) if len(target_group) > 3 else ""
-            protocol = str(target_group[4]) if len(target_group) > 4 else ""
-            raw_members = target_group[5] if len(target_group) > 5 else []
-        elif isinstance(target_group, dict):
-            err_code = target_group.get("error_code", 0)
-            state = str(target_group.get("state", "Unknown"))
-            protocol_type = str(target_group.get("protocol_type", ""))
-            protocol = str(target_group.get("protocol", ""))
-            raw_members = target_group.get("members", [])
-        else:
-            err_code = getattr(target_group, "error_code", 0)
-            state = str(getattr(target_group, "state", "Unknown"))
-            protocol_type = str(getattr(target_group, "protocol_type", ""))
-            protocol = str(getattr(target_group, "protocol", ""))
-            raw_members = getattr(target_group, "members", [])
-
+        err_code, _, state, protocol_type, protocol, raw_members = _parse_group_item(target_group)
         if err_code != 0:
             raise ValueError(f"消费组 '{group_id}' 查询返回错误码: {err_code}")
 
@@ -648,22 +676,7 @@ class KafkaManager:
         assigned_tps_from_members: set[TopicPartition] = set()
 
         for m in raw_members:
-            if isinstance(m, (tuple, list)):
-                mid = str(m[0]) if len(m) > 0 else ""
-                cid = str(m[1]) if len(m) > 1 else ""
-                chost = str(m[2]) if len(m) > 2 else ""
-                massign = m[4] if len(m) > 4 else b""
-            elif isinstance(m, dict):
-                mid = str(m.get("member_id", ""))
-                cid = str(m.get("client_id", ""))
-                chost = str(m.get("client_host", ""))
-                massign = m.get("member_assignment", b"")
-            else:
-                mid = str(getattr(m, "member_id", ""))
-                cid = str(getattr(m, "client_id", ""))
-                chost = str(getattr(m, "client_host", ""))
-                massign = getattr(m, "member_assignment", b"")
-
+            mid, cid, chost, massign = _parse_member_item(m)
             m_partitions: list[dict[str, Any]] = []
             if massign and isinstance(massign, (bytes, bytearray)):
                 try:

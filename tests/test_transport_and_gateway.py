@@ -87,3 +87,19 @@ def test_sse_app_endpoints_mount() -> None:
 
     assert "/sse" in route_paths
     assert any("/messages" in r for r in route_paths)
+
+
+@pytest.mark.asyncio
+async def test_prompt_inspect_topic_messages_rendering() -> None:
+    """验证 inspect_topic_messages Prompt 渲染模板包含采样排查指引."""
+    server = create_mcp_server(KafkaConfig())
+    prompt_res = await server.get_prompt(
+        "inspect_topic_messages",
+        arguments={"topic": "billing-events", "limit": "20"},
+    )
+    assert len(prompt_res.messages) == 1
+    text = prompt_res.messages[0].content.text
+    assert "billing-events" in text
+    assert "kafka_sample_messages" in text
+    assert "零位移安全采样读取" in text
+

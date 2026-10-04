@@ -366,6 +366,38 @@ def create_mcp_server(
             f"   - **行动建议**：给出具体处置方案（如横向扩容消费者实例、按 Key 散列重分区、调优 `max.poll.records`、排查下游数据库慢查询等）。"
         )
 
+    # 11. 注册主题消息采样探查与清洗分析 Prompt
+    @server.prompt(
+        name="inspect_topic_messages",
+        description="引导大模型对 Kafka 主题消息数据进行采样探查、载荷反序列化校验与业务数据清洗分析",
+    )
+    def inspect_topic_messages(
+        topic: str,
+        limit: int = 10,
+        strategy: str = "latest",
+    ) -> str:
+        """生成主题消息采样探查与数据分析引导提示词.
+
+        @param topic 待探查的 Kafka 主题名称
+        @param limit 采样消息条数 (默认 10)
+        @param strategy 采样策略 (latest / earliest / offset)
+        @return 结构化探查引导提示词
+        """
+        return (
+            f"请对 Kafka 主题 `{topic}` 开展消息内容只读采样与业务载荷质量分析。\n\n"
+            f"## 探查步骤建议\n"
+            f"1. **零位移安全采样读取**：\n"
+            f"   - 调用 `kafka_sample_messages(topic='{topic}', strategy='{strategy}', limit={limit})` 瞬态拉取样本消息（该工具不接入消费组、绝不提交消费位移，不会影响下游业务生产进度）。\n\n"
+            f"2. **载荷格式与元数据校验**：\n"
+            f"   - **编码识别**：检查返回消息中每条消息的 `encoding` 字段（是否为期望的 `json` 或 `text`，若降级为 `base64` 排查是否存在 Avro/Protobuf 或非 UTF-8 编码）。\n"
+            f"   - **键 (Key) 与标头 (Headers)**：评估业务路由键是否合理分布，标头是否包含必要的 TraceID、事件类型等链路追踪信息。\n"
+            f"   - **数据结构与模式一致性 (Schema Validation)**：抽检载荷字段结构，判断关键业务字段是否存在空值或脏数据。\n\n"
+            f"3. **输出探查评估报告**：\n"
+            f"   - **消息概览**：分区分布、时间戳新鲜度、载荷平均大小。\n"
+            f"   - **数据质量诊断**：格式规范性、模式一致性评估、异常样本归纳。\n"
+            f"   - **优化建议**：针对序列化格式、消息体积、路由键设计提出优化方案。"
+        )
+
     return server
 
 

@@ -46,19 +46,21 @@
 13. 作为开发者，我希望 MCP 服务端支持 Stdio 管道与 HTTP SSE 两种传输协议，以便既能用于桌面客户端（如 Claude Desktop），也能容器化部署常驻运行。
 14. 作为 AI Agent，我希望通过 MCP Resources 读取动态集群概况与主题元数据，以便在会话中直接挂载只读上下文。
 15. 作为 AI Agent，我希望调用预置的 Prompts 模板（如消费积压根因诊断），以便快速生成标准的运维排查指引与分析方案。
+16. 作为开发者与运维工程师，我希望能够通过 YAML 配置文件 (`--config connections.yaml`) 统一声明并纳管多套物理隔离的 Kafka 集群（如 default、staging、production），并在工具调用时按需路由或对生产连接实施细粒度只读保护，以便在单一会话中无缝跨环境协同运维。
 
 ## 实现决策 (Implementation Decisions)
 
 - **框架与构建后端**：基于 Python 3.10+、FastMCP 框架与 `uv` 构建，采用 `hatchling` 构建后端，严格遵循 PEP 621 标准。
 - **底层驱动架构**：消息生产、消息消费及基础通信基于 `aiokafka` 纯异步驱动，保障高并发无阻塞；管理类操作（Topic CRUD、消费组与 Lag 计算）封装为异步 Admin 接口协同调度。
 - **协议能力设计**：
-  - **Tools 列表**：
+  - **Tools 列表 (10 项，全量支持可选 `connection` 动态路由参数)**：
+    - `kafka_list_connections`：枚举当前服务端已配置的所有 Kafka 集群命名连接清单及只读状态；
     - `kafka_cluster_info`：获取集群概况与 Broker 节点列表；
     - `kafka_list_topics`：列出所有主题及其分区基本信息；
     - `kafka_describe_topic`：查询指定主题的详细分区、副本与配置；
-    - `kafka_create_topic`：创建新主题（支持指定 partitions 与 replication_factor，只读模式下不可用）；
-    - `kafka_delete_topic`：删除主题（强制 `confirm: bool = False` 防御，只读模式下不可用）；
-    - `kafka_produce_message`：向主题发送消息（支持 key、value、headers，只读模式下不可用）；
+    - `kafka_create_topic`：创建新主题（支持指定 partitions 与 replication_factor，只读模式或只读连接下拦截）；
+    - `kafka_delete_topic`：删除主题（强制 `confirm: bool = False` 防御，只读模式或只读连接下拦截）；
+    - `kafka_produce_message`：向主题发送消息（支持 key、value、headers，只读模式或只读连接下拦截）；
     - `kafka_sample_messages`：零位移提交只读采样消息（支持 topic、partition、offset/strategy、limit）；
     - `kafka_list_consumer_groups`：列出集群所有消费组；
     - `kafka_describe_consumer_group`：查询消费组详情及各分区的 Committed Offset 与 Lag。

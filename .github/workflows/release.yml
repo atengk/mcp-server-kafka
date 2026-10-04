@@ -55,6 +55,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 发布安装包至 PyPI
+        run: |
+          uv publish dist/*.whl dist/*.tar.gz
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
   # ----------------------------------------------------------------------------
   # 构建多架构 Docker 镜像并推送至 GHCR (GitHub Container Registry)
   # ----------------------------------------------------------------------------
@@ -102,3 +108,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false

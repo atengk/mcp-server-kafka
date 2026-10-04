@@ -11,7 +11,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from mcp_server_kafka.config import KafkaConfig, parse_cli_args
-from mcp_server_kafka.manager import KafkaManager
+from mcp_server_kafka.manager import KafkaManager, KafkaManagerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -19,39 +19,66 @@ logger = logging.getLogger(__name__)
 def create_mcp_server(
     config: KafkaConfig | None = None,
     manager: KafkaManager | None = None,
+    registry: KafkaManagerRegistry | None = None,
 ) -> MCPServer:
     """构建并装配 Kafka MCP 服务端实例.
 
     @param config 服务运行时配置，默认从环境变量或预设缺省值加载
-    @param manager Kafka 连接管理器实例，传入 None 时基于配置自动实例化
+    @param manager 单个 Kafka 连接管理器实例，传入时自动挂载为默认连接
+    @param registry 完整的多集群连接注册中心实例，优先使用
     @return 已装配 Tools 与 Resources 的 MCPServer 实例
     """
     cfg = config or KafkaConfig.from_env()
-    mgr = manager or KafkaManager(cfg)
+    if registry is not None:
+        reg = registry
+    elif manager is not None:
+        reg = KafkaManagerRegistry(cfg)
+        reg._managers[cfg.default_connection] = manager
+    else:
+        reg = KafkaManagerRegistry(cfg)
 
     server = MCPServer(
-        name="mcp-server-kafka",
-        instructions="Apache Kafka 模型上下文协议 (MCP) 服务端，支持集群元数据只读查询、主题管理与消息排查.",
+        name="atengk-mcp-server-kafka",
+        instructions="Apache Kafka 模型上下文协议 (MCP) 服务端，支持多集群管理、元数据探查、零位移采样与积压诊断.",
     )
 
-    # 1. 注册集群元数据查询 Tool
+    # 1. 注册集群连接清单查询 Tool
+    @server.tool(
+        name="kafka_list_connections",
+        description="枚举当前服务端已配置的所有 Kafka 集群命名连接清单、Broker 引导地址与只读保护状态",
+    )
+    async def kafka_list_connections() -> dict[str, Any]:
+        """枚举所有已配置的 Kafka 集群连接.
+
+        @return 包含 connections 列表与 default_connection 标识的字典
+        """
+        connections = reg.list_connections()
+        return {
+            "default_connection": reg.default_connection_name,
+            "connections": [c.model_dump() for c in connections],
+            "count": len(connections),
+        }
+
+    # 2. 注册集群元数据查询 Tool
     @server.tool(
         name="kafka_cluster_info",
         description="获取 Kafka 集群整体元数据与 Broker 节点列表（包含 Cluster ID、控制器与节点地址）",
     )
-    async def kafka_cluster_info() -> dict[str, Any]:
+    async def kafka_cluster_info(connection: str | None = None) -> dict[str, Any]:
         """获取 Kafka 集群元数据与 Broker 节点信息.
 
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含集群标识符、控制器及节点列表的元数据字典；失败时返回错误描述字典
         """
         try:
+            mgr = reg.get_manager(connection)
             cluster = await mgr.get_cluster_metadata()
             return cluster.model_dump()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("获取 Kafka 集群元数据失败: %s", exc)
+            logger.warning("获取 Kafka 集群元数据失败 [connection=%s]: %s", connection, exc)
             return {"error": f"获取集群元数据失败: {exc}"}
 
-    # 2. 注册主题列表查询 Tool
+    # 3. 注册主题列表查询 Tool
     @server.tool(
         name="kafka_list_topics",
         description="列出 Kafka 集群中的主题清单（支持按名称模式过滤并默认排除内部系统主题）",
@@ -59,42 +86,51 @@ def create_mcp_server(
     async def kafka_list_topics(
         pattern: str | None = None,
         include_internal: bool = False,
+        connection: str | None = None,
     ) -> dict[str, Any]:
         """列出 Kafka 集群中的主题摘要信息.
 
         @param pattern 可选名称模式过滤字符串（模糊匹配）
         @param include_internal 是否包含系统内部主题 (如 __consumer_offsets)
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含主题清单 topics 与总数 count 的结果字典；失败时返回错误描述字典
         """
         try:
+            mgr = reg.get_manager(connection)
             summaries = await mgr.list_topics(pattern=pattern, include_internal=include_internal)
             return {
+                "connection": connection or reg.default_connection_name,
                 "topics": [s.model_dump() for s in summaries],
                 "count": len(summaries),
             }
         except Exception as exc:  # noqa: BLE001
-            logger.warning("获取 Kafka 主题列表失败: %s", exc)
+            logger.warning("获取 Kafka 主题列表失败 [connection=%s]: %s", connection, exc)
             return {"error": f"获取主题列表失败: {exc}"}
 
-    # 3. 注册主题详细信息查询 Tool
+    # 4. 注册主题详细信息查询 Tool
     @server.tool(
         name="kafka_describe_topic",
         description="查询指定 Kafka 主题的详细拓扑（分区分布、Leader 节点、ISR 同步副本与配置）",
     )
-    async def kafka_describe_topic(topic_name: str) -> dict[str, Any]:
+    async def kafka_describe_topic(
+        topic_name: str,
+        connection: str | None = None,
+    ) -> dict[str, Any]:
         """查询指定 Kafka 主题详细信息.
 
         @param topic_name 目标主题名称
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含分区列表与自定义配置的主题详情字典
         """
         try:
+            mgr = reg.get_manager(connection)
             detail = await mgr.describe_topic(topic_name=topic_name)
             return detail.model_dump()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("查询 Kafka 主题详情失败 [topic=%s]: %s", topic_name, exc)
+            logger.warning("查询 Kafka 主题详情失败 [topic=%s, connection=%s]: %s", topic_name, connection, exc)
             return {"error": f"查询主题详情失败: {exc}"}
 
-    # 4. 注册消息采样 Tool (零提交位移只读探查)
+    # 5. 注册消息采样 Tool (零提交位移只读探查)
     @server.tool(
         name="kafka_sample_messages",
         description="从指定 Kafka 主题以零提交位移方式只读采样消息（支持 latest/earliest/offset 策略与自适应解码）",
@@ -105,6 +141,7 @@ def create_mcp_server(
         strategy: str = "latest",
         offset: int | None = None,
         limit: int = 10,
+        connection: str | None = None,
     ) -> dict[str, Any]:
         """以零位移影响方式采样拉取主题消息.
 
@@ -113,9 +150,11 @@ def create_mcp_server(
         @param strategy 采样策略 (latest / earliest / offset)，默认 latest
         @param offset 当 strategy=offset 时的起始数值
         @param limit 采样条数限制，默认 10，上限 100
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含 messages 列表与 total 总数的结果字典；失败时返回错误描述字典
         """
         try:
+            mgr = reg.get_manager(connection)
             sampled = await mgr.sample_messages(
                 topic=topic,
                 partition=partition,
@@ -124,54 +163,63 @@ def create_mcp_server(
                 limit=limit,
             )
             return {
+                "connection": connection or reg.default_connection_name,
                 "topic": topic,
                 "messages": [m.model_dump() for m in sampled],
                 "total": len(sampled),
             }
         except Exception as exc:  # noqa: BLE001
-            logger.warning("采样 Kafka 消息失败 [topic=%s]: %s", topic, exc)
+            logger.warning("采样 Kafka 消息失败 [topic=%s, connection=%s]: %s", topic, connection, exc)
             return {"error": f"采样消息失败: {exc}"}
 
-    # 5. 注册消费组列表查询 Tool
+    # 6. 注册消费组列表查询 Tool
     @server.tool(
         name="kafka_list_consumer_groups",
         description="列出 Kafka 集群中的消费组清单（包含 Group ID、协议类型与活跃状态如 Stable/Empty/Dead）",
     )
-    async def kafka_list_consumer_groups() -> dict[str, Any]:
+    async def kafka_list_consumer_groups(connection: str | None = None) -> dict[str, Any]:
         """列出 Kafka 集群中的消费组摘要信息.
 
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含消费组清单 groups 与总数 count 的结果字典；失败时返回错误描述字典
         """
         try:
+            mgr = reg.get_manager(connection)
             groups = await mgr.list_consumer_groups()
             return {
+                "connection": connection or reg.default_connection_name,
                 "groups": [g.model_dump() for g in groups],
                 "count": len(groups),
             }
         except Exception as exc:  # noqa: BLE001
-            logger.warning("获取 Kafka 消费组列表失败: %s", exc)
+            logger.warning("获取 Kafka 消费组列表失败 [connection=%s]: %s", connection, exc)
             return {"error": f"获取消费组列表失败: {exc}"}
 
-    # 6. 注册消费组详情与积压分析 Tool
+    # 7. 注册消费组详情与积压分析 Tool
     @server.tool(
         name="kafka_describe_consumer_group",
         description="查询指定 Kafka 消费组的详细拓扑，包含活跃成员、分区 Committed Offset、LEO 及 Lag 积压数值",
     )
-    async def kafka_describe_consumer_group(group_id: str) -> dict[str, Any]:
+    async def kafka_describe_consumer_group(
+        group_id: str,
+        connection: str | None = None,
+    ) -> dict[str, Any]:
         """查询指定 Kafka 消费组详细拓扑与分区积压.
 
         @param group_id 目标消费组 ID
+        @param connection 可选集群连接别名，未传或为空时使用默认连接
         @return 包含活跃成员分配及各分区 Lag 积压明细的详情字典；失败时返回错误描述字典
         """
         try:
+            mgr = reg.get_manager(connection)
             detail = await mgr.describe_consumer_group(group_id=group_id)
             return detail.model_dump()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("查询 Kafka 消费组详情失败 [group_id=%s]: %s", group_id, exc)
+            logger.warning("查询 Kafka 消费组详情失败 [group_id=%s, connection=%s]: %s", group_id, connection, exc)
             return {"error": f"查询消费组详情失败: {exc}"}
 
-    # 7. 注册写操作 Tools (双重安全防线之一：只读模式隐藏拦截)
-    if not cfg.read_only:
+    # 8. 注册写操作 Tools (双重安全防线：全局只读隐藏 + 连接级只读精准拦截)
+    if not reg.global_config.read_only:
 
         @server.tool(
             name="kafka_create_topic",
@@ -181,22 +229,28 @@ def create_mcp_server(
             topic_name: str,
             partitions: int = 1,
             replication_factor: int = 1,
+            connection: str | None = None,
         ) -> dict[str, Any]:
             """创建新的 Kafka 主题.
 
             @param topic_name 待创建的主题名称
             @param partitions 分区数量，默认 1
             @param replication_factor 副本因子，默认 1
+            @param connection 可选集群连接别名，未传或为空时使用默认连接
             @return 创建状态结果描述
             """
+            target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
+            if reg.is_connection_read_only(target_name):
+                return {"error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行创建主题操作"}
             try:
+                mgr = reg.get_manager(connection)
                 return await mgr.create_topic(
                     topic_name=topic_name,
                     partitions=partitions,
                     replication_factor=replication_factor,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("创建 Kafka 主题失败 [topic=%s]: %s", topic_name, exc)
+                logger.warning("创建 Kafka 主题失败 [topic=%s, connection=%s]: %s", topic_name, connection, exc)
                 return {"error": f"创建主题失败: {exc}"}
 
         @server.tool(
@@ -206,22 +260,28 @@ def create_mcp_server(
         async def kafka_delete_topic(
             topic_name: str,
             confirm: bool = False,
+            connection: str | None = None,
         ) -> dict[str, Any]:
             """删除指定的 Kafka 主题.
 
             @param topic_name 待删除的主题名称
             @param confirm 破坏性操作显式确认标志，必须为 True 方可执行
+            @param connection 可选集群连接别名，未传或为空时使用默认连接
             @return 删除状态结果描述
             """
+            target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
+            if reg.is_connection_read_only(target_name):
+                return {"error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行删除主题操作"}
             # 二级防线：破坏性动作显式二次确认校验
             if not confirm:
                 return {
                     "error": "删除主题属于高危破坏性操作，必须显式传入 confirm=True 二次确认以防数据丢失",
                 }
             try:
+                mgr = reg.get_manager(connection)
                 return await mgr.delete_topic(topic_name=topic_name)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("删除 Kafka 主题失败 [topic=%s]: %s", topic_name, exc)
+                logger.warning("删除 Kafka 主题失败 [topic=%s, connection=%s]: %s", topic_name, connection, exc)
                 return {"error": f"删除主题失败: {exc}"}
 
         @server.tool(
@@ -234,6 +294,7 @@ def create_mcp_server(
             key: str | None = None,
             partition: int | None = None,
             headers: dict[str, str] | None = None,
+            connection: str | None = None,
         ) -> dict[str, Any]:
             """向指定主题发送业务消息.
 
@@ -242,9 +303,14 @@ def create_mcp_server(
             @param key 可选消息键
             @param partition 可选指定目标分区编号
             @param headers 可选自定义标头字典
+            @param connection 可选集群连接别名，未传或为空时使用默认连接
             @return 写入确认元数据字典；失败时返回错误描述字典
             """
+            target_name = connection.strip() if connection and connection.strip() else reg.default_connection_name
+            if reg.is_connection_read_only(target_name):
+                return {"error": f"目标 Kafka 集群连接 '{target_name}' 已配置为只读保护模式，禁止执行发送消息操作"}
             try:
+                mgr = reg.get_manager(connection)
                 res = await mgr.produce_message(
                     topic=topic,
                     value=value,
@@ -254,7 +320,7 @@ def create_mcp_server(
                 )
                 return res.model_dump()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("生产 Kafka 消息失败 [topic=%s]: %s", topic, exc)
+                logger.warning("生产 Kafka 消息失败 [topic=%s, connection=%s]: %s", topic, connection, exc)
                 return {"error": f"发送消息失败: {exc}"}
 
 
@@ -271,7 +337,8 @@ def create_mcp_server(
         @return Markdown 格式的集群摘要文本；失败时返回错误描述文本
         """
         try:
-            cluster = await mgr.get_cluster_metadata()
+            mgr_instance = reg.get_manager()
+            cluster = await mgr_instance.get_cluster_metadata()
             cluster_id_str = cluster.cluster_id or "未知 (未启用 Cluster ID)"
             controller_desc = (
                 f"节点 ID {cluster.controller.node_id} ({cluster.controller.host}:{cluster.controller.port})"
@@ -310,7 +377,8 @@ def create_mcp_server(
         @return Markdown 格式的主题分区与副本拓扑明细
         """
         try:
-            detail = await mgr.describe_topic(topic_name=topic)
+            mgr_instance = reg.get_manager()
+            detail = await mgr_instance.describe_topic(topic_name=topic)
             lines = [
                 f"# 主题拓扑详情: {detail.name}\n",
                 f"- **是否内部主题**: {'是' if detail.is_internal else '否'}",

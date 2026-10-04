@@ -182,3 +182,19 @@ class ConsumerGroupDetail(BaseModel):
     total_lag: int = Field(default=0, description="消费组在全部有效分区上的总积压消息条数")
 
 
+class KafkaConnectionSummary(BaseModel):
+    """Kafka 集群连接摘要实体.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(description="集群连接逻辑别名")
+    bootstrap_servers: str = Field(description="Broker 引导连接地址列表")
+    read_only: bool = Field(description="是否处于只读保护状态")
+    is_default: bool = Field(default=False, description="是否为系统全局默认回退连接")
+
+
+

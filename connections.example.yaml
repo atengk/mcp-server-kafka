@@ -1,0 +1,33 @@
+# ==============================================================================
+# Apache Kafka MCP 服务端多环境实例连接配置文件模板 (connections.example.yaml)
+# 使用方式: cp connections.example.yaml connections.yaml 并填入实际集群连接地址
+# 启动命令: atengk-mcp-server-kafka --config connections.yaml
+# ==============================================================================
+
+# 全局默认连接别名（当调用工具未显式传 connection 参数时回退至此实例）
+default_connection: "default"
+
+# 全局只读写保护门禁开关 (设置为 true 时所有连接均强制只读；也可通过启动参数 --read-only 强制覆写为 true)
+read_only: false
+
+# 目标 Kafka 集群连接字典
+connections:
+  # 默认本地开发环境实例
+  default:
+    name: "default"
+    # Kafka 集群 Broker 引导连接地址 (多个 Broker 节点以英文逗号分隔)
+    bootstrap_servers: "localhost:9092"
+    # 实例级只读防线开关 (可选，默认继承全局 read_only)
+    read_only: false
+
+  # 测试/预发环境高可用集群示例
+  staging:
+    name: "staging"
+    bootstrap_servers: "kafka-staging-1.internal:9092,kafka-staging-2.internal:9092"
+    read_only: false
+
+  # 生产只读观察节点示例 (连接级强制只读，杜绝误操作)
+  production:
+    name: "production"
+    bootstrap_servers: "kafka-prod-1.internal:9092,kafka-prod-2.internal:9092,kafka-prod-3.internal:9092"
+    read_only: true

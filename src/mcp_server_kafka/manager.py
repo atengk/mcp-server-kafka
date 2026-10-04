@@ -14,13 +14,14 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.coordinator.protocol import ConsumerProtocolMemberAssignment
 
-from mcp_server_kafka.config import KafkaConfig
+from mcp_server_kafka.config import KafkaConfig, KafkaConnectionConfig
 from mcp_server_kafka.models import (
     BrokerInfo,
     ClusterInfo,
     ConsumerGroupDetail,
     ConsumerGroupMember,
     ConsumerGroupSummary,
+    KafkaConnectionSummary,
     PartitionInfo,
     PartitionLag,
     ProduceResult,
@@ -214,10 +215,10 @@ class KafkaManager:
     @since 2026-10-04
     """
 
-    def __init__(self, config: KafkaConfig) -> None:
+    def __init__(self, config: KafkaConnectionConfig | KafkaConfig) -> None:
         """初始化管理器实例.
 
-        @param config Kafka 服务运行时配置
+        @param config 单集群连接配置或全局运行时配置
         """
         self._config = config
         self._admin_client: AIOKafkaAdminClient | None = None
@@ -225,7 +226,7 @@ class KafkaManager:
         self._lock = asyncio.Lock()
 
     @property
-    def config(self) -> KafkaConfig:
+    def config(self) -> KafkaConnectionConfig | KafkaConfig:
         """获取当前运行时配置."""
         return self._config
 
@@ -812,5 +813,98 @@ class KafkaManager:
             partitions=partition_lags,
             total_lag=total_lag,
         )
+
+
+class KafkaManagerRegistry:
+    """多集群 Kafka 管理器注册中心 (Connection Registry).
+
+    负责统一管理各命名连接的 KafkaManager 实例生命周期，提供无状态动态路由与只读安全校验.
+
+    @author Ateng
+    @since 2026-10-04
+    """
+
+    def __init__(self, global_config: KafkaConfig) -> None:
+        """基于全局配置初始化连接注册中心.
+
+        @param global_config 全局配置对象
+        """
+        self._global_config = global_config
+        self._managers: dict[str, KafkaManager] = {}
+
+        # 遍历配置中的各命名连接，初始化独立的 KafkaManager
+        for name, conn_cfg in global_config.connections.items():
+            self._managers[name] = KafkaManager(conn_cfg)
+
+    @property
+    def global_config(self) -> KafkaConfig:
+        """获取系统全局运行时配置."""
+        return self._global_config
+
+    @property
+    def default_connection_name(self) -> str:
+        """获取当前配置的默认集群连接名称."""
+        return self._global_config.default_connection
+
+    def get_manager(self, connection_name: str | None = None) -> KafkaManager:
+        """根据连接别名获取对应的 KafkaManager 实例.
+
+        @param connection_name 集群连接别名，为空或 None 时自动回退至 default_connection
+        @return 对应的 KafkaManager 实例
+        @throws ValueError 当指定别名未配置时抛出
+        """
+        target = (
+            connection_name.strip()
+            if connection_name and connection_name.strip()
+            else self.default_connection_name
+        )
+        if target not in self._managers:
+            valid_names = list(self._managers.keys())
+            raise ValueError(
+                f"未找到名为 '{target}' 的 Kafka 连接配置，当前系统已配置的可用连接为: {valid_names}"
+            )
+        return self._managers[target]
+
+    def is_connection_read_only(self, connection_name: str | None = None) -> bool:
+        """判断指定连接是否处于只读保护状态（全局只读或连接级只读）.
+
+        @param connection_name 集群连接别名
+        @return 若处于只读保护返回 True，否则返回 False
+        """
+        if self._global_config.read_only:
+            return True
+        target = (
+            connection_name.strip()
+            if connection_name and connection_name.strip()
+            else self.default_connection_name
+        )
+        if target in self._global_config.connections:
+            return self._global_config.connections[target].read_only
+        return False
+
+    def list_connections(self) -> list[KafkaConnectionSummary]:
+        """获取所有已配置集群连接的元数据摘要列表.
+
+        @return 连接元数据实体列表（保证非空集合）
+        """
+        result: list[KafkaConnectionSummary] = []
+        for name, conn_cfg in self._global_config.connections.items():
+            is_def = (name == self.default_connection_name)
+            is_ro = bool(self._global_config.read_only or conn_cfg.read_only)
+            result.append(
+                KafkaConnectionSummary(
+                    name=name,
+                    bootstrap_servers=conn_cfg.bootstrap_servers,
+                    read_only=is_ro,
+                    is_default=is_def,
+                )
+            )
+        return result
+
+    async def close_all(self) -> None:
+        """安全关闭并释放注册表中所有集群管理器的底层网络连接与生产通道."""
+        for mgr in self._managers.values():
+            await mgr.close()
+
 
 

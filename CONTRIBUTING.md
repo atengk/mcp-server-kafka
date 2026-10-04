@@ -67,10 +67,10 @@
 平时向 `main` 分支提交代码或合并 PR 时，规范的提交记录（Conventional Commits）会被 `git-cliff` 自动追踪，并在发版时聚合生成更新日志。
 
 ### 2. 同步项目版本号
-发版前在 `pyproject.toml` 中递增 `version` 字段：
+发版前在 `pyproject.toml` 与 `src/mcp_server_kafka/__init__.py` 中同步递增 `version` 字段：
 ```bash
 # 递增后在本地提交
-git commit -am "chore(release): v0.1.0"
+git commit -am "chore(release): v1.1.0"
 ```
 
 ### 3. 打标签并推送到远端（触发发版）
@@ -80,13 +80,14 @@ git commit -am "chore(release): v0.1.0"
 # 步骤 A：确保本地最新代码已推送到 main 分支
 git push origin main
 
-# 步骤 B：打版本标签并推送到 GitHub (支持 v0.1.0, v1.0.0 等)
-git tag v0.1.0
-git push origin v0.1.0
+# 步骤 B：打版本标签并推送到 GitHub (如 v1.1.0, v1.2.0 等)
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 ### 4. 自动化流水线运行
 标签推送后，GitHub Actions 将会自动执行 [`.github/workflows/release.yml`](./.github/workflows/release.yml)：
-- 自动提取自上一版本以来的全部提交与 PR，由 `git-cliff` 格式化为发布日志；
-- 自动创建 GitHub Release 并挂载发布内容；
-- 编译生成 Wheel 与源码包，计算 `checksums.txt` 校验和并挂载至附件。
+- 自动提取自上一版本以来的全部提交与 PR，由 `git-cliff` 格式化生成更新日志；
+- 编译打包 Wheel 与源码包，计算 `checksums.txt` SHA-256 校验和并创建 GitHub Release 挂载附件；
+- 自动通过 `uv publish` 发布安装包至 [PyPI 官方仓库](https://pypi.org/project/atengk-mcp-server-kafka/)；
+- 自动构建并推送纯净无杂质的多架构 (`linux/amd64`, `linux/arm64`) Docker 镜像至 GitHub Container Registry (ghcr.io)。

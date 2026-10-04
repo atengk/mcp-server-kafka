@@ -72,8 +72,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: 检出代码
+      - name: 检出代码 (全量检出供 SemVer 版本比对)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 设置 QEMU 模拟器（支持多架构构建）
         uses: docker/setup-qemu-action@v3
@@ -88,15 +90,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 提取 Docker 镜像标签元数据
+      - name: 提取 Docker 镜像标签元数据 (自动计算 Tag 与 Labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}
 
       - name: 构建并推送多架构镜像 (amd64 / arm64)
         uses: docker/build-push-action@v5

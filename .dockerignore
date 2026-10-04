@@ -11,6 +11,7 @@
 
 # 文档与元数据
 *.md
+!README.md
 LICENSE
 
 # 操作系统与 IDE

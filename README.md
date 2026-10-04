@@ -79,11 +79,27 @@ uv run ruff check .
         "mcp-server-kafka"
       ],
       "env": {
-        "KAFKA_BOOTSTRAP_SERVERS": "localhost:9092"
+        "MCP_KAFKA_BOOTSTRAP_SERVERS": "localhost:9092"
       }
     }
   }
 }
+```
+
+### 4. Docker 与 Docker Compose 运行 (常驻 SSE 网关模式)
+
+本项目已集成多架构 Docker 镜像，并自动发布至 GitHub Container Registry (GHCR)：
+
+```bash
+# 使用 Docker Compose 一键启动常驻服务
+docker compose up -d
+
+# 或使用 docker run 直接启动
+docker run -d \
+  --name mcp-server-kafka \
+  -p 8000:8000 \
+  -e MCP_KAFKA_BOOTSTRAP_SERVERS=host.docker.internal:9092 \
+  ghcr.io/atengk/mcp-server-kafka:latest
 ```
 
 ---
@@ -105,7 +121,8 @@ git push origin v0.1.0
 GitHub Actions 将会自动执行 [`.github/workflows/release.yml`](./.github/workflows/release.yml)：
 1. 提取自上一版本以来的全部合并 PR 与提交记录；
 2. 自动生成 GitHub Release 详情并归类贡献者；
-3. 将打包产物与 SHA-256 校验和自动挂载至 Release 页面附件。
+3. 将打包产物与 SHA-256 校验和自动挂载至 Release 页面附件；
+4. 自动构建多架构 Docker 镜像并推送至 GHCR (`ghcr.io/atengk/mcp-server-kafka`)。
 
 ---
 
@@ -123,7 +140,8 @@ GitHub Actions 将会自动执行 [`.github/workflows/release.yml`](./.github/wo
 │   └── PULL_REQUEST_TEMPLATE.md
 ├── src/
 │   └── mcp_server_kafka/
-│       └── __init__.py
+│       ├── __init__.py
+│       └── server.py
 ├── tests/
 │   ├── __init__.py
 │   └── test_basic.py
@@ -133,6 +151,8 @@ GitHub Actions 将会自动执行 [`.github/workflows/release.yml`](./.github/wo
 ├── .gitattributes
 ├── .gitignore
 ├── CONTRIBUTING.md
+├── docker-compose.yml
+├── Dockerfile
 ├── LICENSE
 ├── README.md
 └── pyproject.toml

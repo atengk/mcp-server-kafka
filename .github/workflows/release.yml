@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   github-release:
@@ -52,16 +53,49 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ----------------------------------------------------------------------------
-  # 发布到 PyPI 插槽（推荐使用 PyPI Trusted Publishing OIDC 机制，按需启用）
+  # 构建多架构 Docker 镜像并推送至 GHCR (GitHub Container Registry)
   # ----------------------------------------------------------------------------
-  # publish-pypi:
-  #   name: 发布至 PyPI
-  #   needs: github-release
-  #   runs-on: ubuntu-latest
-  #   permissions:
-  #     id-token: write
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: astral-sh/setup-uv@v5
-  #     - run: uv build
-  #     - uses: pypa/gh-action-pypi-publish@release/v1
+  publish-docker:
+    name: 构建并推送 Docker 镜像至 GHCR
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 QEMU 模拟器（支持多架构构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GitHub Container Registry (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提取 Docker 镜像标签元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: 构建并推送多架构镜像 (amd64 / arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

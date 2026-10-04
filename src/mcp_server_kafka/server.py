@@ -369,12 +369,33 @@ def create_mcp_server(
     return server
 
 
+def run_server(config: KafkaConfig, server: MCPServer | None = None) -> None:
+    """依据配置启动 MCP 服务并根据传输协议进行调度分流.
+
+    @param config 服务运行时配置
+    @param server 可选传入预构建的 MCPServer 实例，为 None 时自动构建
+    """
+    logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO))
+    srv = server or create_mcp_server(config)
+
+    if config.transport == "sse":
+        logger.info(
+            "启动 Kafka MCP 服务 (HTTP SSE 网关模式): 监听 http://%s:%d",
+            config.host,
+            config.port,
+        )
+        srv.run(transport="sse", host=config.host, port=config.port)
+    else:
+        logger.info("启动 Kafka MCP 服务 (标准 Stdio 管道模式)")
+        srv.run(transport="stdio")
+
+
 def main() -> None:
     """服务主函数 CLI 运行入口."""
     config = parse_cli_args(sys.argv[1:])
-    server = create_mcp_server(config)
-    server.run()
+    run_server(config)
 
 
 if __name__ == "__main__":
     main()
+

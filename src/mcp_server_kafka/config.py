@@ -25,6 +25,22 @@ class KafkaConfig(BaseModel):
         default=False,
         description="全局只读防线开关，开启后拒绝一切写操作",
     )
+    transport: str = Field(
+        default="stdio",
+        description="传输协议网关类型 (stdio / sse)",
+    )
+    host: str = Field(
+        default="0.0.0.0",
+        description="HTTP SSE 网关监听主机地址",
+    )
+    port: int = Field(
+        default=8000,
+        description="HTTP SSE 网关监听端口号",
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="服务运行日志级别 (DEBUG / INFO / WARNING / ERROR)",
+    )
 
     @classmethod
     def from_env(cls) -> "KafkaConfig":
@@ -35,7 +51,28 @@ class KafkaConfig(BaseModel):
         servers = os.getenv("MCP_KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         read_only_raw = os.getenv("MCP_KAFKA_READ_ONLY", "false").strip().lower()
         read_only = read_only_raw in ("true", "1", "yes", "on")
-        return cls(bootstrap_servers=servers, read_only=read_only)
+
+        transport = os.getenv("MCP_KAFKA_TRANSPORT", "stdio").strip().lower()
+        if transport not in ("stdio", "sse"):
+            transport = "stdio"
+
+        host = os.getenv("MCP_KAFKA_SERVER_HOST", "0.0.0.0").strip()
+        port_raw = os.getenv("MCP_KAFKA_SERVER_PORT", "8000").strip()
+        try:
+            port = int(port_raw)
+        except ValueError:
+            port = 8000
+
+        log_level = os.getenv("MCP_KAFKA_LOG_LEVEL", "INFO").strip().upper()
+
+        return cls(
+            bootstrap_servers=servers,
+            read_only=read_only,
+            transport=transport,
+            host=host,
+            port=port,
+            log_level=log_level,
+        )
 
 
 def parse_cli_args(args: list[str] | None = None) -> KafkaConfig:
@@ -58,9 +95,36 @@ def parse_cli_args(args: list[str] | None = None) -> KafkaConfig:
         default=env_config.read_only,
         help="启用全局只读模式，屏蔽一切变更类操作",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default=env_config.transport,
+        help="传输协议网关类型 (默认: 环境变量或 stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=env_config.host,
+        help="HTTP SSE 网关监听主机地址 (默认: 环境变量或 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=env_config.port,
+        help="HTTP SSE 网关监听端口号 (默认: 环境变量或 8000)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=env_config.log_level,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="服务运行日志级别 (默认: 环境变量或 INFO)",
+    )
 
-    parsed, _ = parser.parse_known_args(args)
+    parsed = parser.parse_args(args)
     return KafkaConfig(
         bootstrap_servers=parsed.bootstrap_servers,
         read_only=parsed.read_only,
+        transport=parsed.transport,
+        host=parsed.host,
+        port=parsed.port,
+        log_level=parsed.log_level,
     )
